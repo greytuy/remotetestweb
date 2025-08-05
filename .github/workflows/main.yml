@@ -1,0 +1,82 @@
+name: Build Workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Stage
+    runs-on: windows-latest
+    timeout-minutes: 9999
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Delete old workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        retain_days: 3
+        keep_minimum_runs: 3
+
+    - name: Setup Utilities
+      run: |
+        Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
+        .\cloudflared.exe --version
+
+    - name: Adjust Settings
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+        Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
+
+    - name: Update Credentials
+      run: |
+        $Password = "${{ secrets.RDP_PASSWORD }}"
+        # 验证密码复杂性
+        if ($Password.Length -lt 12 -or 
+            -not ($Password -match '[A-Z]') -or 
+            -not ($Password -match '[a-z]') -or 
+            -not ($Password -match '\d') -or 
+            -not ($Password -match '[^A-Za-z0-9]')) {
+            Write-Error "密码格式错误，构建失败"
+            exit 1
+        }
+        $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        Set-LocalUser -Name "runneradmin" -Password $SecurePassword
+        Write-Host "密码已设置完成"
+
+    - name: Start Service
+      run: |
+        $TunnelToken = "${{ secrets.TUNNEL_TOKEN }}"
+        # 验证Token格式
+        if (-not ($TunnelToken -match '^eyJ')) {
+            Write-Error "Token格式无效，必须以'eyJ'开头"
+            exit 1
+        }
+        Write-Host "正在安装服务..."
+        .\cloudflared.exe service install $TunnelToken
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "服务安装失败"
+            exit 1
+        }
+        Write-Host "等待服务启动..."
+        Start-Sleep -Seconds 5
+        Start-Service cloudflared
+        if ($?) {
+            Write-Host "服务已成功启动"
+        } else {
+            Write-Error "服务启动失败"
+            exit 1
+        }
+
+    - name: Monitor
+      run: |
+
+        Write-Host "Building..."
+        while($true) { Start-Sleep -Seconds 60 }
