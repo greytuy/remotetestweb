@@ -75,8 +75,225 @@ jobs:
             exit 1
         }
 
-    - name: Monitor
+    # ========== OpenClaw 集成 ==========
+
+    - name: Install OpenClaw
       run: |
+        Write-Host "正在安装 OpenClaw..."
+        npm install -g openclaw@latest
+        openclaw --version
+        Write-Host "OpenClaw 安装完成"
+
+    - name: Create Backup Script
+      run: |
+        $scriptContent = @'
+        param(
+            [Parameter(Mandatory=$true)][string]$BackupPAT,
+            [Parameter(Mandatory=$true)][string]$BackupRepo
+        )
+
+        $ErrorActionPreference = "Continue"
+        $stateDir = "$env:USERPROFILE\.openclaw"
+        $tempRepo = "$env:TEMP\openclaw-backup-$(Get-Random)"
+        $zipPath = "$env:TEMP\openclaw-state.zip"
+
+        if (-not $BackupPAT -or -not $BackupRepo) {
+            Write-Host "Backup secrets not configured, skipping"
+            return
+        }
+
+        if (-not (Test-Path $stateDir)) {
+            Write-Host "State directory not found at $stateDir, skipping backup"
+            return
+        }
+
+        try {
+            Write-Host "Compressing state directory..."
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+            Compress-Archive -Path "$stateDir\*" -DestinationPath $zipPath -Force
+            $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+            Write-Host "Compressed: $zipSize MB"
+
+            Write-Host "Cloning backup repository..."
+            $cloneOut = git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $tempRepo 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Clone failed - ensure repo exists and PAT has repo access"
+                Write-Host $cloneOut
+                return
+            }
+
+            Copy-Item $zipPath "$tempRepo\openclaw-state.zip" -Force
+            Push-Location $tempRepo
+            git config user.email "actions@github.com"
+            git config user.name "GitHub Actions"
+            git add -A
+            $msg = "Backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            git commit -m $msg 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                git push 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Backup pushed: $msg"
+                } else {
+                    Write-Host "Push failed"
+                }
+            } else {
+                Write-Host "No changes to commit"
+            }
+            Pop-Location
+        }
+        catch {
+            Write-Host "Backup error: $_"
+        }
+        finally {
+            if (Test-Path variable:tempRepo) {
+                if (Test-Path $tempRepo) {
+                    Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        '@
+        $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
+        Set-Content -Path $scriptPath -Value $scriptContent -Encoding UTF8
+        Write-Host "Backup script created at: $scriptPath"
+
+    - name: Restore OpenClaw State
+      env:
+        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+      run: |
+        $stateDir = "$env:USERPROFILE\.openclaw"
+        $tempRepo = "$env:TEMP\openclaw-restore-$(Get-Random)"
+
+        # 配置 git（后续备份步骤也需要）
+        git config --global user.email "actions@github.com"
+        git config --global user.name "GitHub Actions"
+
+        if (-not $env:BACKUP_PAT -or -not $env:BACKUP_REPO) {
+            Write-Host "Backup secrets not configured, skipping restore"
+            Write-Host "Please connect via RDP and run: openclaw onboard"
+            exit 0
+        }
+
+        Write-Host "Cloning backup repository..."
+        $cloneOut = git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>&1
+
+        if ($LASTEXITCODE -eq 0 -and (Test-Path "$tempRepo\openclaw-state.zip")) {
+            Write-Host "Found previous backup, restoring..."
+            if (-not (Test-Path $stateDir)) {
+                New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+            }
+            Expand-Archive -Path "$tempRepo\openclaw-state.zip" -DestinationPath $stateDir -Force
+            Write-Host "State restored to $stateDir"
+        } else {
+            Write-Host "========================================="
+            Write-Host "  No previous backup found"
+            Write-Host "  This appears to be the first run"
+            Write-Host "  Please connect via RDP and run:"
+            Write-Host "    openclaw onboard"
+            Write-Host "========================================="
+        }
+
+        if (Test-Path $tempRepo) {
+            Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
+        }
+
+    - name: Start OpenClaw Gateway
+      run: |
+        $configPath = "$env:USERPROFILE\.openclaw\openclaw.json"
+        if (Test-Path $configPath) {
+            Write-Host "Config found, starting OpenClaw Gateway..."
+            Start-Process -FilePath "openclaw" -ArgumentList "gateway" -WindowStyle Hidden
+            Start-Sleep -Seconds 5
+            Write-Host "OpenClaw Gateway started in background"
+        } else {
+            Write-Host "No config found, skipping Gateway auto-start"
+            Write-Host "Complete onboard via RDP first, then run: openclaw gateway"
+        }
+
+    # ========== 带定时备份的监控循环 ==========
+
+    - name: Monitor and Periodic Backup
+      env:
+        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+      run: |
+        $backupInterval = 1800   # 30 minutes
+        $maxRuntime = 20700      # 5h45m (leave 15min for cleanup before 6h limit)
+        $elapsed = 0
+        $lastBackup = 0
+        $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
 
         Write-Host "Building..."
-        while($true) { Start-Sleep -Seconds 60 }
+        Write-Host "Monitor started | Max runtime: $([math]::Round($maxRuntime/3600, 1))h | Backup interval: $($backupInterval/60)min"
+
+        while ($elapsed -lt $maxRuntime) {
+            Start-Sleep -Seconds 60
+            $elapsed += 60
+
+            # 每30分钟执行一次备份
+            if (($elapsed - $lastBackup) -ge $backupInterval) {
+                $runMin = [math]::Round($elapsed / 60)
+                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Periodic backup (running ${runMin}min)..."
+                try {
+                    & $scriptPath -BackupPAT $env:BACKUP_PAT -BackupRepo $env:BACKUP_REPO
+                }
+                catch {
+                    Write-Host "Backup failed: $_"
+                }
+                $lastBackup = $elapsed
+            }
+        }
+
+        Write-Host "Approaching 6-hour GitHub Actions limit, exiting monitor loop"
+
+    # ========== 最终备份（无论正常退出、取消、超时都会执行） ==========
+
+    - name: Final State Backup
+      if: always()
+      env:
+        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+      run: |
+        Write-Host "Running final state backup..."
+        $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
+
+        if (Test-Path $scriptPath) {
+            & $scriptPath -BackupPAT $env:BACKUP_PAT -BackupRepo $env:BACKUP_REPO
+        } else {
+            # 内联兜底备份（当备份脚本还没创建时）
+            $stateDir = "$env:USERPROFILE\.openclaw"
+            if (-not (Test-Path $stateDir)) {
+                Write-Host "No OpenClaw state to backup"
+                exit 0
+            }
+            if (-not $env:BACKUP_PAT -or -not $env:BACKUP_REPO) {
+                Write-Host "Backup secrets not configured, skipping"
+                exit 0
+            }
+            $zipPath = "$env:TEMP\openclaw-state.zip"
+            $tempRepo = "$env:TEMP\openclaw-final-backup"
+            try {
+                if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+                Compress-Archive -Path "$stateDir\*" -DestinationPath $zipPath -Force
+                git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    Copy-Item $zipPath "$tempRepo\openclaw-state.zip" -Force
+                    Push-Location $tempRepo
+                    git config user.email "actions@github.com"
+                    git config user.name "GitHub Actions"
+                    git add -A
+                    git commit -m "Final backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" 2>&1 | Out-Null
+                    git push 2>&1 | Out-Null
+                    Pop-Location
+                }
+            }
+            catch {
+                Write-Host "Inline backup error: $_"
+            }
+            finally {
+                if (Test-Path $tempRepo) {
+                    Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        Write-Host "Final backup complete"
