@@ -109,8 +109,14 @@ jobs:
 
         try {
             Write-Host "Compressing state directory..."
+            # 先用 robocopy 复制到临时目录，跳过被锁定的文件和临时文件
+            $tempCopy = "$env:TEMP\openclaw-copy-$(Get-Random)"
+            if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
+            robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
+            # robocopy 退出码 0-7 均为成功
             if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-            Compress-Archive -Path "$stateDir\*" -DestinationPath $zipPath -Force
+            Compress-Archive -Path "$tempCopy\*" -DestinationPath $zipPath -Force
+            Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
             $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
             Write-Host "Compressed: $zipSize MB"
 
@@ -273,8 +279,12 @@ jobs:
             $zipPath = "$env:TEMP\openclaw-state.zip"
             $tempRepo = "$env:TEMP\openclaw-final-backup"
             try {
+                $tempCopy = "$env:TEMP\openclaw-copy-final"
+                if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
+                robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
                 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-                Compress-Archive -Path "$stateDir\*" -DestinationPath $zipPath -Force
+                Compress-Archive -Path "$tempCopy\*" -DestinationPath $zipPath -Force
+                Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
                 git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>$null
                 if ($LASTEXITCODE -eq 0) {
                     Copy-Item $zipPath "$tempRepo\openclaw-state.zip" -Force
