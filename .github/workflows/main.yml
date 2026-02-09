@@ -95,7 +95,7 @@ jobs:
         $ErrorActionPreference = "Continue"
         $stateDir = "$env:USERPROFILE\.openclaw"
         $tempRepo = "$env:TEMP\openclaw-backup-$(Get-Random)"
-        $zipPath = "$env:TEMP\openclaw-state.zip"
+        $archiveBase = "$env:TEMP\openclaw-state.7z"
 
         if (-not $BackupPAT -or -not $BackupRepo) {
             Write-Host "Backup secrets not configured, skipping"
@@ -114,11 +114,14 @@ jobs:
             if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
             robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
             # robocopy 退出码 0-7 均为成功
-            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-            Compress-Archive -Path "$tempCopy\*" -DestinationPath $zipPath -Force
+            # 清理旧的 7z 分片文件
+            Get-Item "$env:TEMP\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+            # 使用 7zip 压缩并自动分片（每片 95MB，确保不超 GitHub 100MB 限制）
+            & 7z a -v95m -mx=7 -mmt=on $archiveBase "$tempCopy\*" | Out-Null
             Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
-            $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
-            Write-Host "Compressed: $zipSize MB"
+            $archiveFiles = @(Get-Item "$env:TEMP\openclaw-state.7z.*")
+            $totalSize = [math]::Round(($archiveFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
+            Write-Host "Compressed: $totalSize MB ($($archiveFiles.Count) part(s))"
 
             Write-Host "Cloning backup repository..."
             $cloneOut = git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $tempRepo 2>&1
@@ -128,7 +131,11 @@ jobs:
                 return
             }
 
-            Copy-Item $zipPath "$tempRepo\openclaw-state.zip" -Force
+            # 清理仓库中的旧格式文件（旧 zip 和旧 7z 分片）
+            Remove-Item "$tempRepo\openclaw-state.zip" -Force -ErrorAction SilentlyContinue
+            Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+            # 复制新的 7z 分片到仓库
+            $archiveFiles | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
             Push-Location $tempRepo
             git config user.email "actions@github.com"
             git config user.name "GitHub Actions"
@@ -138,7 +145,7 @@ jobs:
             if ($LASTEXITCODE -eq 0) {
                 git push 2>&1 | Out-Null
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Backup pushed: $msg"
+                    Write-Host "Backup pushed: $msg ($($archiveFiles.Count) part(s))"
                 } else {
                     Write-Host "Push failed"
                 }
@@ -183,8 +190,19 @@ jobs:
         Write-Host "Cloning backup repository..."
         $cloneOut = git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>&1
 
-        if ($LASTEXITCODE -eq 0 -and (Test-Path "$tempRepo\openclaw-state.zip")) {
-            Write-Host "Found previous backup, restoring..."
+        # 兼容检测：优先新格式（7z 分片），其次旧格式（zip）
+        $has7z = ($LASTEXITCODE -eq 0) -and (Test-Path "$tempRepo\openclaw-state.7z.001")
+        $hasZip = ($LASTEXITCODE -eq 0) -and (Test-Path "$tempRepo\openclaw-state.zip")
+
+        if ($has7z) {
+            Write-Host "Found 7z backup (new format), restoring..."
+            if (-not (Test-Path $stateDir)) {
+                New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+            }
+            & 7z x "$tempRepo\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
+            Write-Host "State restored to $stateDir"
+        } elseif ($hasZip) {
+            Write-Host "Found zip backup (legacy format), restoring..."
             if (-not (Test-Path $stateDir)) {
                 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
             }
@@ -375,18 +393,22 @@ jobs:
                 Write-Host "Backup secrets not configured, skipping"
                 exit 0
             }
-            $zipPath = "$env:TEMP\openclaw-state.zip"
+            $archiveBase = "$env:TEMP\openclaw-state.7z"
             $tempRepo = "$env:TEMP\openclaw-final-backup"
             try {
                 $tempCopy = "$env:TEMP\openclaw-copy-final"
                 if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
                 robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
-                if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-                Compress-Archive -Path "$tempCopy\*" -DestinationPath $zipPath -Force
+                Get-Item "$env:TEMP\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+                & 7z a -v95m -mx=7 -mmt=on $archiveBase "$tempCopy\*" | Out-Null
                 Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
                 git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>$null
                 if ($LASTEXITCODE -eq 0) {
-                    Copy-Item $zipPath "$tempRepo\openclaw-state.zip" -Force
+                    # 清理仓库中的旧格式文件
+                    Remove-Item "$tempRepo\openclaw-state.zip" -Force -ErrorAction SilentlyContinue
+                    Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+                    # 复制新的 7z 分片
+                    @(Get-Item "$env:TEMP\openclaw-state.7z.*") | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
                     Push-Location $tempRepo
                     git config user.email "actions@github.com"
                     git config user.name "GitHub Actions"
