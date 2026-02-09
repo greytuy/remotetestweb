@@ -229,7 +229,7 @@ jobs:
         BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
       run: |
         $backupInterval = 1800   # 30 minutes
-        $maxRuntime = 20700      # 5h45m (leave 15min for cleanup before 6h limit)
+        $maxRuntime = 21000      # 5h50m, 之后自动退出做最终备份，workflow 正常结束
         $elapsed = 0
         $lastBackup = 0
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
@@ -367,7 +367,7 @@ jobs:
             }
         }
 
-        Write-Host "Approaching 6-hour GitHub Actions limit, exiting monitor loop"
+        Write-Host "building finished"
 
     # ========== 最终备份（无论正常退出、取消、超时都会执行） ==========
 
