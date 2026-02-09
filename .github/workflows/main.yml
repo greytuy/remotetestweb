@@ -217,24 +217,25 @@ jobs:
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
         $configPath = "$env:USERPROFILE\.openclaw\openclaw.json"
         $gwLogFile = "$env:TEMP\openclaw-gw.log"
-        $gwErrFile = "$env:TEMP\openclaw-gw-err.log"
-        $gatewayProcess = $null
+        $gatewayJob = $null
 
-        # 启动 Gateway 的函数
+        # 用 Start-Job 启动 Gateway（避免 .cmd 不是有效 Win32 程序的问题）
         function Start-Gateway {
-            $args_list = @("gateway", "--port", "18789", "--force")
-            $proc = Start-Process -FilePath "openclaw" -ArgumentList $args_list -NoNewWindow -PassThru -RedirectStandardOutput $gwLogFile -RedirectStandardError $gwErrFile
+            # 清理旧日志
+            if (Test-Path $gwLogFile) { Remove-Item $gwLogFile -Force -ErrorAction SilentlyContinue }
+            $job = Start-Job -ScriptBlock {
+                param($log)
+                openclaw gateway --port 18789 --force 2>&1 | Out-File $log -Append
+            } -ArgumentList $gwLogFile
             Start-Sleep -Seconds 5
-            if (-not $proc.HasExited) {
-                Write-Host "OpenClaw Gateway running (PID: $($proc.Id))"
-                return $proc
+            if ($job.State -eq 'Running') {
+                Write-Host "OpenClaw Gateway running (Job ID: $($job.Id), State: $($job.State))"
+                return $job
             } else {
-                $exitCode = $proc.ExitCode
-                Write-Host "Gateway exited with code: $exitCode"
-                if (Test-Path $gwErrFile) {
-                    $errContent = Get-Content $gwErrFile -Tail 10 -ErrorAction SilentlyContinue
-                    if ($errContent) { Write-Host "Gateway error: $errContent" }
-                }
+                Write-Host "Gateway failed to start (State: $($job.State))"
+                $output = Receive-Job $job -ErrorAction SilentlyContinue
+                if ($output) { Write-Host "Gateway output: $output" }
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
                 return $null
             }
         }
@@ -244,7 +245,7 @@ jobs:
         # 启动 OpenClaw Gateway（如果配置存在）
         if (Test-Path $configPath) {
             Write-Host "Config found, starting OpenClaw Gateway on port 18789..."
-            $gatewayProcess = Start-Gateway
+            $gatewayJob = Start-Gateway
         } else {
             Write-Host "No config found, skipping Gateway auto-start"
             Write-Host "Complete onboard via RDP first, then run: openclaw gateway --port 18789"
@@ -255,9 +256,10 @@ jobs:
             $elapsed += 60
 
             # 检测 Gateway 是否存活，挂了就自动重启
-            if ((Test-Path $configPath) -and ($null -eq $gatewayProcess -or $gatewayProcess.HasExited)) {
+            if ((Test-Path $configPath) -and ($null -eq $gatewayJob -or $gatewayJob.State -ne 'Running')) {
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Gateway not running, restarting..."
-                $gatewayProcess = Start-Gateway
+                if ($null -ne $gatewayJob) { Remove-Job $gatewayJob -Force -ErrorAction SilentlyContinue }
+                $gatewayJob = Start-Gateway
             }
 
             # 每30分钟执行一次备份
