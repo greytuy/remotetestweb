@@ -245,8 +245,10 @@ jobs:
 
             # 用 cmd.exe 启动（cmd.exe 是真正的 Win32 可执行文件，可以处理 .cmd 包装器）
             # 输出重定向写在 cmd 命令行里，不经过 PowerShell 管道
+            # 不用 --force（它依赖 lsof，是 Linux 工具，Windows 上没有）
+            # 端口清理已由上面的 Stop-GatewayProcess 完成
             Start-Process -FilePath "cmd.exe" `
-                -ArgumentList "/c", "openclaw gateway --port 18789 --force > `"$gwLogFile`" 2>&1" `
+                -ArgumentList "/c", "openclaw gateway --port 18789 > `"$gwLogFile`" 2>&1" `
                 -WindowStyle Hidden
 
             # 等待最多 30 秒检测端口是否开始监听
