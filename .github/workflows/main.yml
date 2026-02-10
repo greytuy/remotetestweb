@@ -122,6 +122,7 @@ jobs:
             $archiveFiles = @(Get-Item "$env:TEMP\openclaw-state.7z.*")
             $totalSize = [math]::Round(($archiveFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
             Write-Host "Compressed: $totalSize MB ($($archiveFiles.Count) part(s))"
+            $archiveFiles | ForEach-Object { Write-Host "  Part: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
 
             Write-Host "Cloning backup repository..."
             $cloneOut = git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $tempRepo 2>&1
@@ -136,23 +137,91 @@ jobs:
             Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
             # 复制新的 7z 分片到仓库
             $archiveFiles | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
+
+            # ---- 校验1：确认所有分片都已复制到仓库目录 ----
+            $copiedFiles = @(Get-Item "$tempRepo\openclaw-state.7z.*")
+            if ($copiedFiles.Count -ne $archiveFiles.Count) {
+                Write-Host "WARNING: Copy count mismatch! Expected $($archiveFiles.Count), found $($copiedFiles.Count). Retrying copy..."
+                $archiveFiles | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
+                $copiedFiles = @(Get-Item "$tempRepo\openclaw-state.7z.*")
+            }
+            $copyOk = $true
+            foreach ($af in $archiveFiles) {
+                $cf = Get-Item "$tempRepo\$($af.Name)" -ErrorAction SilentlyContinue
+                if (-not $cf) {
+                    Write-Host "ERROR: Missing $($af.Name) in repo dir after copy"
+                    $copyOk = $false
+                } elseif ($cf.Length -ne $af.Length) {
+                    Write-Host "ERROR: Size mismatch $($af.Name): source=$($af.Length) copied=$($cf.Length)"
+                    $copyOk = $false
+                }
+            }
+            if (-not $copyOk) {
+                Write-Host "FATAL: Copy verification failed, aborting this backup"
+                return
+            }
+            Write-Host "Copy verified OK: $($copiedFiles.Count) part(s), all sizes match"
+
             Push-Location $tempRepo
             git config user.email "actions@github.com"
             git config user.name "GitHub Actions"
             git add -A
-            $msg = "Backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            $msg = "Backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$($archiveFiles.Count) parts, ${totalSize}MB]"
+            $pushSuccess = $false
             git commit -m $msg 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 git push 2>&1 | Out-Null
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Backup pushed: $msg ($($archiveFiles.Count) part(s))"
+                    Write-Host "Backup pushed: $msg"
+                    $pushSuccess = $true
                 } else {
-                    Write-Host "Push failed"
+                    Write-Host "Push failed, retrying in 5 seconds..."
+                    Start-Sleep -Seconds 5
+                    git push 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "Push succeeded on retry"
+                        $pushSuccess = $true
+                    } else {
+                        Write-Host "Push failed on retry as well"
+                    }
                 }
             } else {
                 Write-Host "No changes to commit"
             }
             Pop-Location
+
+            # ---- 校验2：推送后重新拉取远程仓库，验证分片数量和大小 ----
+            if ($pushSuccess) {
+                $verifyDir = "$env:TEMP\openclaw-verify-$(Get-Random)"
+                try {
+                    git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $verifyDir 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        $remoteFiles = @(Get-Item "$verifyDir\openclaw-state.7z.*" -ErrorAction SilentlyContinue)
+                        if ($remoteFiles.Count -eq $archiveFiles.Count) {
+                            $allMatch = $true
+                            foreach ($af in $archiveFiles) {
+                                $rf = Get-Item "$verifyDir\$($af.Name)" -ErrorAction SilentlyContinue
+                                if (-not $rf -or $rf.Length -ne $af.Length) {
+                                    $allMatch = $false
+                                    Write-Host "VERIFY WARNING: $($af.Name) size mismatch on remote"
+                                }
+                            }
+                            if ($allMatch) {
+                                Write-Host "VERIFIED OK: Remote has $($remoteFiles.Count)/$($archiveFiles.Count) part(s), all sizes match"
+                            } else {
+                                Write-Host "VERIFY WARNING: Part count matches but some sizes differ"
+                            }
+                        } else {
+                            Write-Host "VERIFY FAILED: Remote has $($remoteFiles.Count) part(s) but expected $($archiveFiles.Count)!"
+                            Write-Host "WARNING: Backup may be incomplete. Will retry on next backup cycle."
+                        }
+                    } else {
+                        Write-Host "Verify clone failed, skipping post-push verification"
+                    }
+                } finally {
+                    Remove-Item -Recurse -Force $verifyDir -ErrorAction SilentlyContinue
+                }
+            }
         }
         catch {
             Write-Host "Backup error: $_"
@@ -195,12 +264,27 @@ jobs:
         $hasZip = ($LASTEXITCODE -eq 0) -and (Test-Path "$tempRepo\openclaw-state.zip")
 
         if ($has7z) {
-            Write-Host "Found 7z backup (new format), restoring..."
-            if (-not (Test-Path $stateDir)) {
-                New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+            $restoreParts = @(Get-Item "$tempRepo\openclaw-state.7z.*")
+            Write-Host "Found 7z backup (new format), $($restoreParts.Count) part(s):"
+            $restoreParts | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
+            # 解压前先做完整性测试，防止损坏或不完整的压缩包覆盖已有数据
+            Write-Host "Testing archive integrity..."
+            $testOutput = & 7z t "$tempRepo\openclaw-state.7z.001" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "========================================="
+                Write-Host "  ERROR: Archive integrity test FAILED!"
+                Write-Host "  The backup may be corrupted or incomplete."
+                Write-Host "  Restore skipped to protect existing state."
+                Write-Host "========================================="
+                Write-Host ($testOutput | Out-String)
+            } else {
+                Write-Host "Integrity OK, extracting..."
+                if (-not (Test-Path $stateDir)) {
+                    New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+                }
+                & 7z x "$tempRepo\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
+                Write-Host "State restored to $stateDir"
             }
-            & 7z x "$tempRepo\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
-            Write-Host "State restored to $stateDir"
         } elseif ($hasZip) {
             Write-Host "Found zip backup (legacy format), restoring..."
             if (-not (Test-Path $stateDir)) {
@@ -402,20 +486,60 @@ jobs:
                 Get-Item "$env:TEMP\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
                 & 7z a -v95m -mx=7 -mmt=on $archiveBase "$tempCopy\*" | Out-Null
                 Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
+                $inlineArchives = @(Get-Item "$env:TEMP\openclaw-state.7z.*")
+                $inlineTotalSize = [math]::Round(($inlineArchives | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
+                Write-Host "Compressed: $inlineTotalSize MB ($($inlineArchives.Count) part(s))"
+                $inlineArchives | ForEach-Object { Write-Host "  Part: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
                 git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>$null
                 if ($LASTEXITCODE -eq 0) {
                     # 清理仓库中的旧格式文件
                     Remove-Item "$tempRepo\openclaw-state.zip" -Force -ErrorAction SilentlyContinue
                     Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
                     # 复制新的 7z 分片
-                    @(Get-Item "$env:TEMP\openclaw-state.7z.*") | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
+                    $inlineArchives | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
+                    # 校验复制完整性
+                    $inlineCopied = @(Get-Item "$tempRepo\openclaw-state.7z.*")
+                    if ($inlineCopied.Count -ne $inlineArchives.Count) {
+                        Write-Host "WARNING: Copy mismatch ($($inlineCopied.Count)/$($inlineArchives.Count)), retrying..."
+                        $inlineArchives | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
+                    }
                     Push-Location $tempRepo
                     git config user.email "actions@github.com"
                     git config user.name "GitHub Actions"
                     git add -A
-                    git commit -m "Final backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" 2>&1 | Out-Null
-                    git push 2>&1 | Out-Null
+                    $finalMsg = "Final backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$($inlineArchives.Count) parts, ${inlineTotalSize}MB]"
+                    git commit -m $finalMsg 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        git push 2>&1 | Out-Null
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Host "Push failed, retrying..."
+                            Start-Sleep -Seconds 5
+                            git push 2>&1 | Out-Null
+                        }
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "Final backup pushed: $finalMsg"
+                        } else {
+                            Write-Host "Final backup push failed after retry"
+                        }
+                    }
                     Pop-Location
+                    # 推送后校验远程分片完整性
+                    if ($LASTEXITCODE -eq 0) {
+                        $verifyDir = "$env:TEMP\openclaw-final-verify"
+                        try {
+                            git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $verifyDir 2>&1 | Out-Null
+                            if ($LASTEXITCODE -eq 0) {
+                                $remoteFiles = @(Get-Item "$verifyDir\openclaw-state.7z.*" -ErrorAction SilentlyContinue)
+                                if ($remoteFiles.Count -eq $inlineArchives.Count) {
+                                    Write-Host "VERIFIED OK: Remote has $($remoteFiles.Count)/$($inlineArchives.Count) part(s)"
+                                } else {
+                                    Write-Host "VERIFY FAILED: Remote has $($remoteFiles.Count) but expected $($inlineArchives.Count) part(s)!"
+                                }
+                            }
+                        } finally {
+                            Remove-Item -Recurse -Force $verifyDir -ErrorAction SilentlyContinue
+                        }
+                    }
                 }
             }
             catch {
