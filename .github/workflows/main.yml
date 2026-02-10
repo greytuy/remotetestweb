@@ -229,7 +229,7 @@ jobs:
         BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
       run: |
         $backupInterval = 1800   # 30 minutes
-        $maxRuntime = 21000      # 5h50m, 之后自动退出做最终备份，workflow 正常结束
+        $maxRuntime = 20700      # 5h45m, 之后自动退出做最终备份，workflow 正常结束
         $elapsed = 0
         $lastBackup = 0
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
