@@ -88,17 +88,17 @@ jobs:
       run: |
         $scriptContent = @'
         param(
-            [Parameter(Mandatory=$true)][string]$BackupPAT,
-            [Parameter(Mandatory=$true)][string]$BackupRepo
+            [Parameter(Mandatory=$true)][string]$WebDavUrl,
+            [Parameter(Mandatory=$true)][string]$WebDavUser,
+            [Parameter(Mandatory=$true)][string]$WebDavPass
         )
 
         $ErrorActionPreference = "Continue"
         $stateDir = "$env:USERPROFILE\.openclaw"
-        $tempRepo = "$env:TEMP\openclaw-backup-$(Get-Random)"
         $archiveBase = "$env:TEMP\openclaw-state.7z"
 
-        if (-not $BackupPAT -or -not $BackupRepo) {
-            Write-Host "Backup secrets not configured, skipping"
+        if (-not $WebDavUrl -or -not $WebDavUser -or -not $WebDavPass) {
+            Write-Host "WebDAV credentials not configured, skipping backup"
             return
         }
 
@@ -113,125 +113,75 @@ jobs:
             $tempCopy = "$env:TEMP\openclaw-copy-$(Get-Random)"
             if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
             robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
-            # robocopy 退出码 0-7 均为成功
+            
             # 清理旧的 7z 分片文件
             Get-Item "$env:TEMP\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-            # 使用 7zip 压缩并自动分片（每片 95MB，确保不超 GitHub 100MB 限制）
+            
+            # 使用 7zip 压缩并自动分片（每片 95MB）
             & 7z a -v95m -mx=7 -mmt=on $archiveBase "$tempCopy\*" | Out-Null
             Remove-Item -Recurse -Force $tempCopy -ErrorAction SilentlyContinue
+            
             $archiveFiles = @(Get-Item "$env:TEMP\openclaw-state.7z.*")
             $totalSize = [math]::Round(($archiveFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
             Write-Host "Compressed: $totalSize MB ($($archiveFiles.Count) part(s))"
             $archiveFiles | ForEach-Object { Write-Host "  Part: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
 
-            Write-Host "Cloning backup repository..."
-            $cloneOut = git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $tempRepo 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "Clone failed - ensure repo exists and PAT has repo access"
-                Write-Host $cloneOut
-                return
+            # ---- 上传到 WebDAV ----
+            Write-Host "Uploading to WebDAV..."
+            $credential = New-Object System.Management.Automation.PSCredential($WebDavUser, (ConvertTo-SecureString $WebDavPass -AsPlainText -Force))
+            
+            # 确保 WebDAV URL 以 / 结尾
+            $baseUrl = $WebDavUrl.TrimEnd('/') + '/openclaw-backup'
+            
+            # 创建备份目录（WebDAV MKCOL）
+            try {
+                Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+            } catch {
+                # 目录可能已存在，忽略错误
             }
-
-            # 清理仓库中的旧格式文件（旧 zip 和旧 7z 分片）
-            Remove-Item "$tempRepo\openclaw-state.zip" -Force -ErrorAction SilentlyContinue
-            Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-            # 复制新的 7z 分片到仓库
-            $archiveFiles | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
-
-            # ---- 校验1：确认所有分片都已复制到仓库目录 ----
-            $copiedFiles = @(Get-Item "$tempRepo\openclaw-state.7z.*")
-            if ($copiedFiles.Count -ne $archiveFiles.Count) {
-                Write-Host "WARNING: Copy count mismatch! Expected $($archiveFiles.Count), found $($copiedFiles.Count). Retrying copy..."
-                $archiveFiles | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
-                $copiedFiles = @(Get-Item "$tempRepo\openclaw-state.7z.*")
-            }
-            $copyOk = $true
-            foreach ($af in $archiveFiles) {
-                $cf = Get-Item "$tempRepo\$($af.Name)" -ErrorAction SilentlyContinue
-                if (-not $cf) {
-                    Write-Host "ERROR: Missing $($af.Name) in repo dir after copy"
-                    $copyOk = $false
-                } elseif ($cf.Length -ne $af.Length) {
-                    Write-Host "ERROR: Size mismatch $($af.Name): source=$($af.Length) copied=$($cf.Length)"
-                    $copyOk = $false
-                }
-            }
-            if (-not $copyOk) {
-                Write-Host "FATAL: Copy verification failed, aborting this backup"
-                return
-            }
-            Write-Host "Copy verified OK: $($copiedFiles.Count) part(s), all sizes match"
-
-            Push-Location $tempRepo
-            git config user.email "actions@github.com"
-            git config user.name "GitHub Actions"
-            git add -A
-            $msg = "Backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$($archiveFiles.Count) parts, ${totalSize}MB]"
-            $pushSuccess = $false
-            git commit -m $msg 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                git push 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Backup pushed: $msg"
-                    $pushSuccess = $true
-                } else {
-                    Write-Host "Push failed, retrying in 5 seconds..."
-                    Start-Sleep -Seconds 5
-                    git push 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Host "Push succeeded on retry"
-                        $pushSuccess = $true
-                    } else {
-                        Write-Host "Push failed on retry as well"
-                    }
-                }
-            } else {
-                Write-Host "No changes to commit"
-            }
-            Pop-Location
-
-            # ---- 校验2：推送后重新拉取远程仓库，验证分片数量和大小 ----
-            if ($pushSuccess) {
-                $verifyDir = "$env:TEMP\openclaw-verify-$(Get-Random)"
+            
+            $uploadSuccess = $true
+            $uploadedCount = 0
+            
+            foreach ($part in $archiveFiles) {
+                $uploadUrl = "$baseUrl/$($part.Name)"
+                Write-Host "  Uploading $($part.Name)..."
+                
                 try {
-                    git clone --depth 1 "https://${BackupPAT}@github.com/${BackupRepo}.git" $verifyDir 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        $remoteFiles = @(Get-Item "$verifyDir\openclaw-state.7z.*" -ErrorAction SilentlyContinue)
-                        if ($remoteFiles.Count -eq $archiveFiles.Count) {
-                            $allMatch = $true
-                            foreach ($af in $archiveFiles) {
-                                $rf = Get-Item "$verifyDir\$($af.Name)" -ErrorAction SilentlyContinue
-                                if (-not $rf -or $rf.Length -ne $af.Length) {
-                                    $allMatch = $false
-                                    Write-Host "VERIFY WARNING: $($af.Name) size mismatch on remote"
-                                }
-                            }
-                            if ($allMatch) {
-                                Write-Host "VERIFIED OK: Remote has $($remoteFiles.Count)/$($archiveFiles.Count) part(s), all sizes match"
-                            } else {
-                                Write-Host "VERIFY WARNING: Part count matches but some sizes differ"
-                            }
-                        } else {
-                            Write-Host "VERIFY FAILED: Remote has $($remoteFiles.Count) part(s) but expected $($archiveFiles.Count)!"
-                            Write-Host "WARNING: Backup may be incomplete. Will retry on next backup cycle."
-                        }
+                    $response = Invoke-WebRequest -Uri $uploadUrl -Method 'PUT' -InFile $part.FullName -Credential $credential -UseBasicParsing -TimeoutSec 300
+                    
+                    if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204) {
+                        $uploadedCount++
+                        Write-Host "    OK ($($response.StatusCode))"
                     } else {
-                        Write-Host "Verify clone failed, skipping post-push verification"
+                        Write-Host "    Unexpected status: $($response.StatusCode)"
+                        $uploadSuccess = $false
                     }
-                } finally {
-                    Remove-Item -Recurse -Force $verifyDir -ErrorAction SilentlyContinue
+                } catch {
+                    Write-Host "    FAILED: $_"
+                    Write-Host "    Error details: $($_.Exception.Message)"
+                    if ($_.Exception.Response) {
+                        Write-Host "    HTTP Status: $($_.Exception.Response.StatusCode.value__) $($_.Exception.Response.StatusDescription)"
+                    }
+                    $uploadSuccess = $false
                 }
+                
+                # 避免触发速率限制
+                Start-Sleep -Milliseconds 500
+            }
+            
+            if ($uploadSuccess -and $uploadedCount -eq $archiveFiles.Count) {
+                Write-Host "WebDAV backup completed: $uploadedCount/$($archiveFiles.Count) part(s) uploaded successfully"
+                
+                # 清理本地临时分片文件
+                $archiveFiles | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+            } else {
+                Write-Host "WARNING: Backup incomplete - only $uploadedCount/$($archiveFiles.Count) part(s) uploaded"
             }
         }
         catch {
             Write-Host "Backup error: $_"
-        }
-        finally {
-            if (Test-Path variable:tempRepo) {
-                if (Test-Path $tempRepo) {
-                    Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
-                }
-            }
+            Write-Host "Error details: $($_.Exception.Message)"
         }
         '@
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
@@ -309,8 +259,9 @@ jobs:
 
     - name: Monitor and Periodic Backup
       env:
-        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+        WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+        WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
       run: |
         $backupInterval = 1800   # 30 minutes
         $maxRuntime = 20700      # 5h45m, 之后自动退出做最终备份，workflow 正常结束
@@ -442,10 +393,11 @@ jobs:
                 $runMin = [math]::Round($elapsed / 60)
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Periodic backup (running ${runMin}min)..."
                 try {
-                    & $scriptPath -BackupPAT $env:BACKUP_PAT -BackupRepo $env:BACKUP_REPO
+                    & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASS
                 }
                 catch {
                     Write-Host "Backup failed: $_"
+                    Write-Host "Error details: $($_.Exception.Message)"
                 }
                 $lastBackup = $elapsed
             }
@@ -458,14 +410,15 @@ jobs:
     - name: Final State Backup
       if: always()
       env:
-        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+        WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+        WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
       run: |
         Write-Host "Running final state backup..."
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
 
         if (Test-Path $scriptPath) {
-            & $scriptPath -BackupPAT $env:BACKUP_PAT -BackupRepo $env:BACKUP_REPO
+            & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASS
         } else {
             # 内联兜底备份（当备份脚本还没创建时）
             $stateDir = "$env:USERPROFILE\.openclaw"
@@ -473,12 +426,11 @@ jobs:
                 Write-Host "No OpenClaw state to backup"
                 exit 0
             }
-            if (-not $env:BACKUP_PAT -or -not $env:BACKUP_REPO) {
-                Write-Host "Backup secrets not configured, skipping"
+            if (-not $env:WEBDAV_URL -or -not $env:WEBDAV_USER -or -not $env:WEBDAV_PASS) {
+                Write-Host "WebDAV credentials not configured, skipping backup"
                 exit 0
             }
             $archiveBase = "$env:TEMP\openclaw-state.7z"
-            $tempRepo = "$env:TEMP\openclaw-final-backup"
             try {
                 $tempCopy = "$env:TEMP\openclaw-copy-final"
                 if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
@@ -490,65 +442,41 @@ jobs:
                 $inlineTotalSize = [math]::Round(($inlineArchives | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
                 Write-Host "Compressed: $inlineTotalSize MB ($($inlineArchives.Count) part(s))"
                 $inlineArchives | ForEach-Object { Write-Host "  Part: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
-                git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>$null
-                if ($LASTEXITCODE -eq 0) {
-                    # 清理仓库中的旧格式文件
-                    Remove-Item "$tempRepo\openclaw-state.zip" -Force -ErrorAction SilentlyContinue
-                    Get-Item "$tempRepo\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-                    # 复制新的 7z 分片
-                    $inlineArchives | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
-                    # 校验复制完整性
-                    $inlineCopied = @(Get-Item "$tempRepo\openclaw-state.7z.*")
-                    if ($inlineCopied.Count -ne $inlineArchives.Count) {
-                        Write-Host "WARNING: Copy mismatch ($($inlineCopied.Count)/$($inlineArchives.Count)), retrying..."
-                        $inlineArchives | ForEach-Object { Copy-Item $_.FullName $tempRepo -Force }
-                    }
-                    Push-Location $tempRepo
-                    git config user.email "actions@github.com"
-                    git config user.name "GitHub Actions"
-                    git add -A
-                    $finalMsg = "Final backup $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$($inlineArchives.Count) parts, ${inlineTotalSize}MB]"
-                    git commit -m $finalMsg 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        git push 2>&1 | Out-Null
-                        if ($LASTEXITCODE -ne 0) {
-                            Write-Host "Push failed, retrying..."
-                            Start-Sleep -Seconds 5
-                            git push 2>&1 | Out-Null
+                
+                # 上传到 WebDAV
+                Write-Host "Uploading to WebDAV..."
+                $credential = New-Object System.Management.Automation.PSCredential($env:WEBDAV_USER, (ConvertTo-SecureString $env:WEBDAV_PASS -AsPlainText -Force))
+                $baseUrl = $env:WEBDAV_URL.TrimEnd('/') + '/openclaw-backup'
+                
+                try {
+                    Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+                } catch {}
+                
+                $uploadedCount = 0
+                foreach ($part in $inlineArchives) {
+                    $uploadUrl = "$baseUrl/$($part.Name)"
+                    try {
+                        $response = Invoke-WebRequest -Uri $uploadUrl -Method 'PUT' -InFile $part.FullName -Credential $credential -UseBasicParsing -TimeoutSec 300
+                        if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204) {
+                            $uploadedCount++
+                            Write-Host "    $($part.Name) uploaded"
                         }
-                        if ($LASTEXITCODE -eq 0) {
-                            Write-Host "Final backup pushed: $finalMsg"
-                        } else {
-                            Write-Host "Final backup push failed after retry"
-                        }
+                    } catch {
+                        Write-Host "    Upload failed for $($part.Name): $_"
+                        Write-Host "    Error details: $($_.Exception.Message)"
                     }
-                    Pop-Location
-                    # 推送后校验远程分片完整性
-                    if ($LASTEXITCODE -eq 0) {
-                        $verifyDir = "$env:TEMP\openclaw-final-verify"
-                        try {
-                            git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $verifyDir 2>&1 | Out-Null
-                            if ($LASTEXITCODE -eq 0) {
-                                $remoteFiles = @(Get-Item "$verifyDir\openclaw-state.7z.*" -ErrorAction SilentlyContinue)
-                                if ($remoteFiles.Count -eq $inlineArchives.Count) {
-                                    Write-Host "VERIFIED OK: Remote has $($remoteFiles.Count)/$($inlineArchives.Count) part(s)"
-                                } else {
-                                    Write-Host "VERIFY FAILED: Remote has $($remoteFiles.Count) but expected $($inlineArchives.Count) part(s)!"
-                                }
-                            }
-                        } finally {
-                            Remove-Item -Recurse -Force $verifyDir -ErrorAction SilentlyContinue
-                        }
-                    }
+                    Start-Sleep -Milliseconds 500
+                }
+                
+                if ($uploadedCount -eq $inlineArchives.Count) {
+                    Write-Host "Final backup uploaded: $uploadedCount/$($inlineArchives.Count) part(s), ${inlineTotalSize}MB"
+                } else {
+                    Write-Host "WARNING: Final backup incomplete - only $uploadedCount/$($inlineArchives.Count) part(s) uploaded"
                 }
             }
             catch {
                 Write-Host "Inline backup error: $_"
-            }
-            finally {
-                if (Test-Path $tempRepo) {
-                    Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
-                }
+                Write-Host "Error details: $($_.Exception.Message)"
             }
         }
         Write-Host "Final backup complete"
