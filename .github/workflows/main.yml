@@ -90,14 +90,14 @@ jobs:
         param(
             [Parameter(Mandatory=$true)][string]$WebDavUrl,
             [Parameter(Mandatory=$true)][string]$WebDavUser,
-            [Parameter(Mandatory=$true)][string]$WebDavPass
+            [Parameter(Mandatory=$true)][string]$WebDavPassword
         )
 
         $ErrorActionPreference = "Continue"
         $stateDir = "$env:USERPROFILE\.openclaw"
         $archiveBase = "$env:TEMP\openclaw-state.7z"
 
-        if (-not $WebDavUrl -or -not $WebDavUser -or -not $WebDavPass) {
+        if (-not $WebDavUrl -or -not $WebDavUser -or -not $WebDavPassword) {
             Write-Host "WebDAV credentials not configured, skipping backup"
             return
         }
@@ -128,16 +128,42 @@ jobs:
 
             # ---- 上传到 WebDAV ----
             Write-Host "Uploading to WebDAV..."
-            $credential = New-Object System.Management.Automation.PSCredential($WebDavUser, (ConvertTo-SecureString $WebDavPass -AsPlainText -Force))
+            Write-Host "  WebDAV URL: $WebDavUrl"
+            Write-Host "  Username: $WebDavUser"
             
-            # 确保 WebDAV URL 以 / 结尾
+            $credential = New-Object System.Management.Automation.PSCredential($WebDavUser, (ConvertTo-SecureString $WebDavPassword -AsPlainText -Force))
+            
+            # 测试根目录连接（使用 PROPFIND 列出目录）
+            Write-Host "Testing WebDAV connection..."
+            try {
+                $testResponse = Invoke-WebRequest -Uri $WebDavUrl -Method 'PROPFIND' -Credential $credential -UseBasicParsing -TimeoutSec 30
+                Write-Host "  Connection OK (Status: $($testResponse.StatusCode))"
+            } catch {
+                Write-Host "  WARNING: Cannot connect to WebDAV root"
+                Write-Host "  Error: $_"
+                if ($_.Exception.Response) {
+                    Write-Host "  HTTP Status: $($_.Exception.Response.StatusCode.value__)"
+                }
+                Write-Host "  Please check your WEBDAV_URL, WEBDAV_USER (should be Connection ID), and WEBDAV_PASSWORDWORD (should be Apps Password)"
+            }
+            
+            # 确保 WebDAV URL 以 / 结尾，上传到子目录
             $baseUrl = $WebDavUrl.TrimEnd('/') + '/openclaw-backup'
             
-            # 创建备份目录（WebDAV MKCOL）
+            # 尝试创建备份目录
+            Write-Host "Creating backup directory..."
             try {
-                Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+                $mkcolResp = Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -TimeoutSec 30
+                Write-Host "  Directory created (Status: $($mkcolResp.StatusCode))"
             } catch {
-                # 目录可能已存在，忽略错误
+                if ($_.Exception.Response.StatusCode.value__ -eq 405) {
+                    Write-Host "  Directory already exists (405 Method Not Allowed)"
+                } else {
+                    Write-Host "  WARNING: Cannot create directory, uploading to root instead"
+                    Write-Host "  Error: $($_.Exception.Message)"
+                    # 如果创建目录失败，直接上传到根目录
+                    $baseUrl = $WebDavUrl.TrimEnd('/')
+                }
             }
             
             $uploadSuccess = $true
@@ -150,7 +176,7 @@ jobs:
                 try {
                     $response = Invoke-WebRequest -Uri $uploadUrl -Method 'PUT' -InFile $part.FullName -Credential $credential -UseBasicParsing -TimeoutSec 300
                     
-                    if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204) {
+                    if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204 -or $response.StatusCode -eq 200) {
                         $uploadedCount++
                         Write-Host "    OK ($($response.StatusCode))"
                     } else {
@@ -261,7 +287,7 @@ jobs:
       env:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+        WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       run: |
         $backupInterval = 1800   # 30 minutes
         $maxRuntime = 20700      # 5h45m, 之后自动退出做最终备份，workflow 正常结束
@@ -393,7 +419,7 @@ jobs:
                 $runMin = [math]::Round($elapsed / 60)
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Periodic backup (running ${runMin}min)..."
                 try {
-                    & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASS
+                    & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASSWORD
                 }
                 catch {
                     Write-Host "Backup failed: $_"
@@ -412,13 +438,13 @@ jobs:
       env:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+        WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       run: |
         Write-Host "Running final state backup..."
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-openclaw-state.ps1"
 
         if (Test-Path $scriptPath) {
-            & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASS
+            & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPass $env:WEBDAV_PASSWORD
         } else {
             # 内联兜底备份（当备份脚本还没创建时）
             $stateDir = "$env:USERPROFILE\.openclaw"
@@ -426,7 +452,7 @@ jobs:
                 Write-Host "No OpenClaw state to backup"
                 exit 0
             }
-            if (-not $env:WEBDAV_URL -or -not $env:WEBDAV_USER -or -not $env:WEBDAV_PASS) {
+            if (-not $env:WEBDAV_URL -or -not $env:WEBDAV_USER -or -not $env:WEBDAV_PASSWORD) {
                 Write-Host "WebDAV credentials not configured, skipping backup"
                 exit 0
             }
@@ -445,19 +471,41 @@ jobs:
                 
                 # 上传到 WebDAV
                 Write-Host "Uploading to WebDAV..."
-                $credential = New-Object System.Management.Automation.PSCredential($env:WEBDAV_USER, (ConvertTo-SecureString $env:WEBDAV_PASS -AsPlainText -Force))
+                Write-Host "  WebDAV URL: $env:WEBDAV_URL"
+                Write-Host "  Username: $env:WEBDAV_USER"
+                
+                $credential = New-Object System.Management.Automation.PSCredential($env:WEBDAV_USER, (ConvertTo-SecureString $env:WEBDAV_PASSWORD -AsPlainText -Force))
+                
+                # 测试连接
+                Write-Host "Testing WebDAV connection..."
+                try {
+                    $testResponse = Invoke-WebRequest -Uri $env:WEBDAV_URL -Method 'PROPFIND' -Credential $credential -UseBasicParsing -TimeoutSec 30
+                    Write-Host "  Connection OK (Status: $($testResponse.StatusCode))"
+                } catch {
+                    Write-Host "  WARNING: Cannot connect to WebDAV root: $_"
+                }
+                
                 $baseUrl = $env:WEBDAV_URL.TrimEnd('/') + '/openclaw-backup'
                 
+                # 尝试创建目录
                 try {
-                    Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
-                } catch {}
+                    $mkcolResp = Invoke-WebRequest -Uri $baseUrl -Method 'MKCOL' -Credential $credential -UseBasicParsing -TimeoutSec 30
+                    Write-Host "  Directory created"
+                } catch {
+                    if ($_.Exception.Response.StatusCode.value__ -eq 405) {
+                        Write-Host "  Directory already exists"
+                    } else {
+                        Write-Host "  Cannot create directory, uploading to root instead"
+                        $baseUrl = $env:WEBDAV_URL.TrimEnd('/')
+                    }
+                }
                 
                 $uploadedCount = 0
                 foreach ($part in $inlineArchives) {
                     $uploadUrl = "$baseUrl/$($part.Name)"
                     try {
                         $response = Invoke-WebRequest -Uri $uploadUrl -Method 'PUT' -InFile $part.FullName -Credential $credential -UseBasicParsing -TimeoutSec 300
-                        if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204) {
+                        if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 204 -or $response.StatusCode -eq 200) {
                             $uploadedCount++
                             Write-Host "    $($part.Name) uploaded"
                         }
