@@ -4,3 +4,4 @@ src
 wrangler.toml
 .wrangler
 WEBDAV_MIGRATION.md
+.cursor
