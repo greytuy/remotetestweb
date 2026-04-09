@@ -201,128 +201,114 @@ jobs:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
         WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+        BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+        BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
       run: |
         $stateDir = "$env:USERPROFILE\.openclaw"
         $tempDir = "$env:TEMP\openclaw-restore-$(Get-Random)"
+        $restored = $false
 
-        if (-not $env:WEBDAV_URL -or -not $env:WEBDAV_USER -or -not $env:WEBDAV_PASSWORD) {
-            Write-Host "WebDAV secrets not configured, skipping restore"
-            Write-Host "Please connect via RDP and run: openclaw onboard"
-            exit 0
-        }
+        # ============ 尝试 1：从 WebDAV 恢复（新 A/B 格式） ============
+        if (-not $restored -and $env:WEBDAV_URL -and $env:WEBDAV_USER -and $env:WEBDAV_PASSWORD) {
+            $credential = New-Object System.Management.Automation.PSCredential($env:WEBDAV_USER, (ConvertTo-SecureString $env:WEBDAV_PASSWORD -AsPlainText -Force))
+            $baseUrl = $env:WEBDAV_URL.TrimEnd('/')
 
-        $credential = New-Object System.Management.Automation.PSCredential($env:WEBDAV_USER, (ConvertTo-SecureString $env:WEBDAV_PASSWORD -AsPlainText -Force))
-        $baseUrl = $env:WEBDAV_URL.TrimEnd('/')
-
-        # ---- 读取活跃槽位（新 A/B 格式） ----
-        $activeSlot = ""
-        $useLegacy = $false
-        try {
-            $slotResp = Invoke-WebRequest -Uri "$baseUrl/openclaw-slot.txt" -Credential $credential -UseBasicParsing -TimeoutSec 15
-            $activeSlot = $slotResp.Content.Trim()
-            if ($activeSlot -ne "A" -and $activeSlot -ne "B") { $activeSlot = "" }
-        } catch {}
-
-        # ---- 如果没有 A/B 格式，尝试旧格式（openclaw-state.7z.001） ----
-        if (-not $activeSlot) {
-            Write-Host "No A/B slot marker found, checking for legacy format..."
+            $activeSlot = ""
             try {
-                $legacyResp = Invoke-WebRequest -Uri "$baseUrl/openclaw-state.7z.001" -Method Head -Credential $credential -UseBasicParsing -TimeoutSec 15
-                if ($legacyResp.StatusCode -eq 200) {
-                    Write-Host "Found legacy backup format (openclaw-state.7z.*)"
-                    $useLegacy = $true
+                $slotResp = Invoke-WebRequest -Uri "$baseUrl/openclaw-slot.txt" -Credential $credential -UseBasicParsing -TimeoutSec 15
+                $activeSlot = $slotResp.Content.Trim()
+                if ($activeSlot -ne "A" -and $activeSlot -ne "B") { $activeSlot = "" }
+            } catch {}
+
+            if ($activeSlot) {
+                Write-Host "Found WebDAV A/B backup, active slot: $activeSlot"
+                New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+                $partCount = 0
+                try {
+                    $countResp = Invoke-WebRequest -Uri "$baseUrl/openclaw-$activeSlot-count.txt" -Credential $credential -UseBasicParsing -TimeoutSec 15
+                    $partCount = [int]$countResp.Content.Trim()
+                } catch {}
+                $maxParts = if ($partCount -gt 0) { $partCount } else { 50 }
+                $downloadedCount = 0
+
+                for ($i = 1; $i -le $maxParts; $i++) {
+                    $partName = "openclaw-$activeSlot.7z.{0:D3}" -f $i
+                    $localPath = "$tempDir\openclaw-state.7z.{0:D3}" -f $i
+                    try {
+                        Invoke-WebRequest -Uri "$baseUrl/$partName" -Credential $credential -UseBasicParsing -OutFile $localPath -TimeoutSec 120
+                        $downloadedCount++
+                        Write-Host "  Downloaded $partName"
+                    } catch {
+                        if ($partCount -eq 0) { break }
+                        Write-Host "  FAILED: $partName"
+                    }
                 }
-            } catch {
-                Write-Host "No legacy backup found either"
+
+                if ($downloadedCount -gt 0) {
+                    $testOutput = & 7z t "$tempDir\openclaw-state.7z.001" 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+                        & 7z x "$tempDir\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
+                        Write-Host "State restored from WebDAV slot $activeSlot ($downloadedCount parts)"
+                        $restored = $true
+                    } else {
+                        Write-Host "WebDAV slot $activeSlot integrity check FAILED, trying next source..."
+                    }
+                }
+                Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
             }
         }
 
-        if (-not $activeSlot -and -not $useLegacy) {
+        # ============ 尝试 2：从 Git 仓库恢复（一次性迁移回退） ============
+        if (-not $restored -and $env:BACKUP_PAT -and $env:BACKUP_REPO) {
+            Write-Host "Trying Git repository backup (migration fallback)..."
+            $tempRepo = "$env:TEMP\openclaw-git-restore-$(Get-Random)"
+
+            git config --global user.email "actions@github.com"
+            git config --global user.name "GitHub Actions"
+
+            $cloneOut = git clone --depth 1 "https://$env:BACKUP_PAT@github.com/$env:BACKUP_REPO.git" $tempRepo 2>&1
+            if ($LASTEXITCODE -eq 0 -and (Test-Path "$tempRepo\openclaw-state.7z.001")) {
+                $restoreParts = @(Get-Item "$tempRepo\openclaw-state.7z.*")
+                Write-Host "Found Git backup: $($restoreParts.Count) part(s)"
+
+                $testOutput = & 7z t "$tempRepo\openclaw-state.7z.001" 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+                    & 7z x "$tempRepo\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
+                    Write-Host "State restored from Git repository ($($restoreParts.Count) parts)"
+                    $restored = $true
+                } else {
+                    Write-Host "Git backup integrity check FAILED"
+                    Write-Host ($testOutput | Out-String)
+                }
+            } elseif ($LASTEXITCODE -eq 0 -and (Test-Path "$tempRepo\openclaw-state.zip")) {
+                Write-Host "Found Git backup (zip format)"
+                if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+                Expand-Archive -Path "$tempRepo\openclaw-state.zip" -DestinationPath $stateDir -Force
+                Write-Host "State restored from Git repository (zip)"
+                $restored = $true
+            } else {
+                Write-Host "No valid backup found in Git repository"
+            }
+
+            if (Test-Path $tempRepo) { Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue }
+        }
+
+        # ============ 最终结果 ============
+        if ($restored) {
             Write-Host "========================================="
-            Write-Host "  No WebDAV backup found"
-            Write-Host "  This appears to be the first run"
+            Write-Host "  Restore completed successfully"
+            Write-Host "  State directory: $stateDir"
+            Write-Host "========================================="
+        } else {
+            Write-Host "========================================="
+            Write-Host "  No valid backup could be restored"
             Write-Host "  Please connect via RDP and run:"
             Write-Host "    openclaw onboard"
             Write-Host "========================================="
-            exit 0
         }
-
-        # ---- 下载分片 ----
-        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-        $downloadedCount = 0
-
-        if ($useLegacy) {
-            # 旧格式：文件名为 openclaw-state.7z.001 ...
-            Write-Host "Downloading legacy backup..."
-            for ($i = 1; $i -le 50; $i++) {
-                $partName = "openclaw-state.7z.{0:D3}" -f $i
-                $localPath = "$tempDir\$partName"
-                try {
-                    Invoke-WebRequest -Uri "$baseUrl/$partName" -Credential $credential -UseBasicParsing -OutFile $localPath -TimeoutSec 120
-                    $downloadedCount++
-                    Write-Host "  Downloaded $partName"
-                } catch {
-                    Write-Host "  Part $partName not found, assuming $downloadedCount total parts"
-                    break
-                }
-            }
-        } else {
-            # 新 A/B 格式
-            Write-Host "Active backup slot: $activeSlot"
-            $partCount = 0
-            try {
-                $countResp = Invoke-WebRequest -Uri "$baseUrl/openclaw-$activeSlot-count.txt" -Credential $credential -UseBasicParsing -TimeoutSec 15
-                $partCount = [int]$countResp.Content.Trim()
-            } catch {
-                Write-Host "WARNING: Cannot read part count, will try to download parts until 404"
-            }
-            $maxParts = if ($partCount -gt 0) { $partCount } else { 50 }
-
-            for ($i = 1; $i -le $maxParts; $i++) {
-                $partName = "openclaw-$activeSlot.7z.{0:D3}" -f $i
-                $localPath = "$tempDir\openclaw-state.7z.{0:D3}" -f $i
-                $downloadUrl = "$baseUrl/$partName"
-                try {
-                    Invoke-WebRequest -Uri $downloadUrl -Credential $credential -UseBasicParsing -OutFile $localPath -TimeoutSec 120
-                    $downloadedCount++
-                    Write-Host "  Downloaded $partName"
-                } catch {
-                    if ($partCount -eq 0) {
-                        Write-Host "  Part $partName not found, assuming $downloadedCount total parts"
-                        break
-                    }
-                    Write-Host "  FAILED to download $partName : $($_.Exception.Message)"
-                }
-            }
-        }
-
-        if ($downloadedCount -eq 0) {
-            Write-Host "No backup parts downloaded, skipping restore"
-            Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
-            exit 0
-        }
-
-        Write-Host "Downloaded $downloadedCount part(s)"
-
-        # ---- 完整性测试 ----
-        Write-Host "Testing archive integrity..."
-        $testOutput = & 7z t "$tempDir\openclaw-state.7z.001" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "========================================="
-            Write-Host "  ERROR: Archive integrity test FAILED!"
-            Write-Host "  Restore skipped to protect existing state."
-            Write-Host "========================================="
-            Write-Host ($testOutput | Out-String)
-        } else {
-            Write-Host "Integrity OK, extracting..."
-            if (-not (Test-Path $stateDir)) {
-                New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-            }
-            & 7z x "$tempDir\openclaw-state.7z.001" -o"$stateDir" -aoa | Out-Null
-            Write-Host "State restored to $stateDir"
-        }
-
-        Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 
     # ========== 启动 Gateway + 带定时备份的监控循环 ==========
 
