@@ -130,6 +130,7 @@ jobs:
         $debug = $env:CI_DEBUG -eq "true"
         $stateDir = "$env:USERPROFILE\.openclaw"
         $archiveBase = "$env:TEMP\openclaw-state.7z"
+        $gwRestartFlag = "$env:TEMP\openclaw-gw-restart.flag"
 
         if (-not $WebDavUrl -or -not $WebDavUser -or -not $WebDavPassword) {
             if ($debug) { Write-Host "WebDAV credentials not configured, skipping backup" }
@@ -157,10 +158,38 @@ jobs:
         if ($debug) { Write-Host "Current active slot: $currentSlot -> uploading to slot: $nextSlot" }
 
         try {
+            # Stop gateway before copying to avoid file locks and partial writes
+            $gwWasRunning = $false
+            $gwConn = Get-NetTCPConnection -LocalPort 18789 -State Listen -ErrorAction SilentlyContinue
+            if ($null -ne $gwConn) {
+                $gwWasRunning = $true
+                if ($debug) { Write-Host "Stopping gateway before backup to ensure data consistency..." }
+                $gwConn | ForEach-Object {
+                    try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
+                }
+                Get-Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path -and $_.Path -match 'openclaw' } |
+                    Stop-Process -Force -ErrorAction SilentlyContinue
+                foreach ($pn in @("openclaw*", "chrome", "chromium", "msedge")) {
+                    Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                }
+                Get-Process -Name "node" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path -and $_.Path -match 'openclaw' } |
+                    Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                if ($debug) { Write-Host "Gateway stopped" }
+            }
+
             if ($debug) { Write-Host "Compressing state directory..." }
             $tempCopy = "$env:TEMP\openclaw-copy-$(Get-Random)"
             if (Test-Path $tempCopy) { Remove-Item -Recurse -Force $tempCopy }
             robocopy $stateDir $tempCopy /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
+
+            # Signal main loop to restart gateway after file copy is done
+            if ($gwWasRunning) {
+                Set-Content -Path $gwRestartFlag -Value "1" -Force
+                if ($debug) { Write-Host "Flagged gateway for restart" }
+            }
             
             Get-Item "$env:TEMP\openclaw-state.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
             & 7z a -v95m -mx=7 -mmt=on $archiveBase "$tempCopy\*" | Out-Null
@@ -422,11 +451,21 @@ jobs:
             foreach ($c in $conns) {
                 try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
             }
+            Get-Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -and $_.Path -match 'openclaw' } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            foreach ($procName in @("openclaw*", "chrome", "chromium", "msedge")) {
+                Get-Process -Name $procName -ErrorAction SilentlyContinue |
+                    Stop-Process -Force -ErrorAction SilentlyContinue
+            }
+            Get-Process -Name "node" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -and $_.Path -match 'openclaw' } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
         }
 
         function Start-Gateway {
             Stop-GatewayProcess
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 3
             if (Test-Path $gwLogFile) { Remove-Item $gwLogFile -Force -ErrorAction SilentlyContinue }
             Start-Process -FilePath "cmd.exe" `
                 -ArgumentList "/c", "openclaw gateway --port 18789 > `"$gwLogFile`" 2>&1" `
@@ -522,6 +561,20 @@ jobs:
                     if ($debug) { Write-Host "Backup failed: $_" }
                 }
                 $lastBackup = $elapsed
+
+                $gwRestartFlag = "$env:TEMP\openclaw-gw-restart.flag"
+                if ((Test-Path $gwRestartFlag) -and (Test-Path $configPath)) {
+                    Remove-Item $gwRestartFlag -Force -ErrorAction SilentlyContinue
+                    if ($debug) { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Restarting gateway after backup..." }
+                    $gwStarted = Start-Gateway
+                    if ($gwStarted) {
+                        $gwFailCount = 0
+                        if ($debug) { Write-Host "Gateway restarted successfully after backup" }
+                    } else {
+                        $gwFailCount++
+                        if ($debug) { Write-Host "Gateway restart after backup failed ($gwFailCount/$gwMaxFails)" }
+                    }
+                }
             }
         }
 
