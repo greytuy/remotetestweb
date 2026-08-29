@@ -188,6 +188,8 @@ jobs:
             foreach ($d in $existingDirs) {
                 $dest = Join-Path $staging $d.Name
                 robocopy $d.Src $dest /E /R:0 /W:0 /XF *.lock *.tmp /NFL /NDL /NJH /NJS /NS /NC | Out-Null
+                if ($LASTEXITCODE -ge 8) { if ($debug) { Write-Host "  robocopy failed for $($d.Name): exit $LASTEXITCODE" } }
+                $global:LASTEXITCODE = 0
             }
             foreach ($f in $existingFiles) {
                 Copy-Item $f.Src (Join-Path $staging $f.Name) -Force
@@ -299,6 +301,9 @@ jobs:
                 $src = Join-Path $extractDir $t.Name
                 if (Test-Path $src) {
                     robocopy $src $t.Dest /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NS /NC | Out-Null
+                    # robocopy: 0-7 都算成功（1=已复制文件），>=8 才是失败；归一化避免泄漏为步骤退出码
+                    if ($LASTEXITCODE -ge 8) { if ($debug) { Write-Host "  robocopy failed for $($t.Name): exit $LASTEXITCODE" } }
+                    $global:LASTEXITCODE = 0
                 }
             }
             if (Test-Path "$extractDir\claude.json") {
@@ -419,6 +424,8 @@ jobs:
                 Write-Host "No build cache found, clean start"
             }
         }
+
+        exit 0
 
     - name: Build, Test & Deploy
       env:
