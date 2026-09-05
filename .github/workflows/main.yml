@@ -446,7 +446,7 @@ jobs:
       run: |
         $debug = $env:CI_DEBUG -eq "true"
         $backupInterval = 1800
-        $maxRuntime = 20700
+        $maxRuntime = 18600
         $elapsed = 0
         $lastBackup = 0
         $scriptPath = "$env:GITHUB_WORKSPACE\backup-agents-state.ps1"
