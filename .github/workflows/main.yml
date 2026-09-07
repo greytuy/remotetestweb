@@ -455,7 +455,7 @@ jobs:
 
         exit 0
 
-    - name: Install CC Switch and Impeccable in Background
+    - name: Install paka
       continue-on-error: true
       run: |
         # Start after restore so the backup cannot overwrite freshly installed skills.
