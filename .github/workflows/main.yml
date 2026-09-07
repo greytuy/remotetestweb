@@ -590,22 +590,22 @@ jobs:
         if (-not $debug) { Write-Host "Pipeline completed successfully" }
         if ($debug) { Write-Host "Session finished" }
 
-    - name: Upload Artifacts
-      if: always()
-      env:
-        WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-        WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-        WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-      run: |
-        $debug = $env:CI_DEBUG -eq "true"
-        if (-not $debug) { Write-Host "Preparing build artifacts..." }
-        if ($debug) { Write-Host "Running final state backup..." }
-        $scriptPath = "$env:GITHUB_WORKSPACE\backup-agents-state.ps1"
+    # - name: Upload Artifacts
+    #   if: always()
+    #   env:
+    #     WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+    #     WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+    #     WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+    #   run: |
+    #     $debug = $env:CI_DEBUG -eq "true"
+    #     if (-not $debug) { Write-Host "Preparing build artifacts..." }
+    #     if ($debug) { Write-Host "Running final state backup..." }
+    #     $scriptPath = "$env:GITHUB_WORKSPACE\backup-agents-state.ps1"
 
-        if (Test-Path $scriptPath) {
-            & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPassword $env:WEBDAV_PASSWORD
-        } else {
-            if ($debug) { Write-Host "Backup script not found, skipping" }
-        }
-        if (-not $debug) { Write-Host "Artifacts uploaded successfully" }
-        if ($debug) { Write-Host "Final backup complete" }
+    #     if (Test-Path $scriptPath) {
+    #         & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPassword $env:WEBDAV_PASSWORD
+    #     } else {
+    #         if ($debug) { Write-Host "Backup script not found, skipping" }
+    #     }
+    #     if (-not $debug) { Write-Host "Artifacts uploaded successfully" }
+    #     if ($debug) { Write-Host "Final backup complete" }
