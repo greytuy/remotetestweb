@@ -29,6 +29,8 @@ jobs:
     - name: Prepare Backup Storage
       run: |
         $ErrorActionPreference = 'Stop'
+        # Job start time, so the main loop can leave room for the final backup before timeout-minutes.
+        "JOB_START_UNIX=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         if (-not (Test-Path -LiteralPath 'D:\' -PathType Container)) {
             throw 'D: drive is required for project and backup storage'
         }
@@ -886,7 +888,14 @@ jobs:
       run: |
         $debug = $env:CI_DEBUG -eq "true"
         $backupInterval = 1800
-        $maxRuntime = 18600
+        $maxRuntime = 19800          # main loop: 330 min
+        $jobTimeoutSec = 360 * 60    # keep in sync with timeout-minutes
+        $finalReserveSec = 20 * 60   # reserved for the final backup
+        $finalSkipIfRecentSec = 300  # skip final backup if the last one started this recently
+        # Hard deadline measured from job start: setup steps also count against timeout-minutes.
+        $jobStart = 0
+        if ($env:JOB_START_UNIX) { [void][long]::TryParse($env:JOB_START_UNIX, [ref]$jobStart) }
+        $loopDeadlineUnix = if ($jobStart -gt 0) { $jobStart + $jobTimeoutSec - $finalReserveSec } else { [long]::MaxValue }
         $elapsed = 0
         $lastBackup = 0
         $lastBackupFailed = $false
@@ -982,7 +991,7 @@ jobs:
         if (-not $debug) { Write-Host "Starting build pipeline..." }
         if ($debug) { Write-Host "Starting session..." }
 
-        while ($clock.Elapsed.TotalSeconds -lt $maxRuntime) {
+        while ($clock.Elapsed.TotalSeconds -lt $maxRuntime -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $loopDeadlineUnix) {
             Start-Sleep -Seconds 60
             $elapsed = [int]$clock.Elapsed.TotalSeconds
 
@@ -1010,6 +1019,25 @@ jobs:
                 }
                 $lastBackup = $elapsed
             }
+        }
+
+        # ---------- final backup before the job timeout ----------
+        $elapsed = [int]$clock.Elapsed.TotalSeconds
+        if (($elapsed - $lastBackup) -ge $finalSkipIfRecentSec) {
+            if ($debug) { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Final backup (running $([math]::Round($elapsed / 60))min)..." }
+            if (-not $debug) { Write-Host "Running final packaging step..." }
+            try {
+                & $scriptPath -WebDavUrl $env:WEBDAV_URL -WebDavUser $env:WEBDAV_USER -WebDavPassword $env:WEBDAV_PASSWORD
+                $lastBackupFailed = $false
+                if ($debug) { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Final backup done" }
+            }
+            catch {
+                $lastBackupFailed = $true
+                Write-Warning "Final backup failed: $($_.Exception.Message)"
+            }
+        }
+        elseif ($debug) {
+            Write-Host "Final backup skipped: last backup started $([math]::Round(($elapsed - $lastBackup) / 60))min ago"
         }
 
         if ($lastBackupFailed) {
