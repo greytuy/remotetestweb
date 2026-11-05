@@ -199,7 +199,10 @@ jobs:
             $env:RESTIC_CACHE_DIR         = Join-Path $env:AGENTS_BACKUP_ROOT 'restic-cache'
             $global:LASTEXITCODE = 0
             # 8 parallel connections to hide latency; restic packs are raised to 64MB in backup (fewer PUTs)
-            return @('-o', "rclone.program=$rcloneExe", '-o', 'rclone.connections=8', '-o', 'rclone.args=serve restic --stdio --b2-hard-delete --retries 5 --low-level-retries 10 --timeout 10m')
+            # restic splits rclone.program like a command line, which mangles a Windows path ("D:"),
+            # so put rclone on PATH and let restic use its default program name "rclone".
+            if (($env:PATH -split ';') -notcontains $toolsDir) { $env:PATH = "$toolsDir;$env:PATH" }
+            return @('-o', 'rclone.connections=8', '-o', 'rclone.args=serve restic --stdio --b2-hard-delete --retries 5 --low-level-retries 10 --timeout 10m')
         }
 
         # 0 = repo exists, 10 = no repo yet, anything else = cannot tell (network / auth)
