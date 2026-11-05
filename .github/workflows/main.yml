@@ -194,7 +194,7 @@ jobs:
             $env:RCLONE_CONFIG_DAV_URL    = $Url.TrimEnd('/')
             $env:RCLONE_CONFIG_DAV_VENDOR = 'other'
             $env:RCLONE_CONFIG_DAV_USER   = $User
-            $env:RCLONE_CONFIG_DAV_PASS   = ((& $rcloneExe obscure $Password) | Out-String).Trim()
+            $env:RCLONE_CONFIG_DAV_PASS   = (($Password | & $rcloneExe obscure -) | Out-String).Trim()
             $env:RESTIC_REPOSITORY        = 'rclone:dav:restic-pro'
             $env:RESTIC_CACHE_DIR         = Join-Path $env:AGENTS_BACKUP_ROOT 'restic-cache'
             $global:LASTEXITCODE = 0
@@ -205,8 +205,20 @@ jobs:
         # 0 = repo exists, 10 = no repo yet, anything else = cannot tell (network / auth)
         function Get-ResticRepoState {
             param([string[]]$Opts)
-            & $resticExe @Opts cat config *> $null
+            $out = & $resticExe @Opts cat config 2>&1 | Out-String
             $code = $LASTEXITCODE
+            if ($code -ne 0 -and $code -ne 10) {
+                # Some WebDAV servers answer a missing folder with something other than 404, so restic
+                # cannot tell "no repo" from "error". Ask rclone directly: 3 = dir not found, 4 = file not found.
+                $lsOut = & $rcloneExe lsf 'dav:restic-pro/config' 2>&1 | Out-String
+                $lsCode = $LASTEXITCODE
+                if ($lsCode -in 3, 4 -or ($lsCode -eq 0 -and -not $lsOut.Trim())) {
+                    $code = 10
+                } else {
+                    Write-Host "restic cat config (exit $code): $($out.Trim())"
+                    Write-Host "rclone lsf restic-pro/config (exit $lsCode): $($lsOut.Trim())"
+                }
+            }
             $global:LASTEXITCODE = 0
             return $code
         }
