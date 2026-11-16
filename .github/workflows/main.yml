@@ -21,8 +21,9 @@ jobs:
       CI_DEBUG: ${{ inputs.debug }}
       AGENTS_BACKUP_ROOT: 'D:\agents-backup'
       AGENTS_PRO_DIR: 'D:\pro'
-      RESTIC_VERSION: '0.19.1'
-      RCLONE_VERSION: '1.76.0'
+      # Workflow version pins must not use tool-owned environment variable names.
+      AGENTS_RESTIC_VERSION: '0.19.1'
+      AGENTS_RCLONE_VERSION: '1.76.0'
 
     steps:
     - name: Checkout
@@ -198,7 +199,11 @@ jobs:
             $env:RCLONE_CONFIG_DAV_URL    = $Url.TrimEnd('/')
             $env:RCLONE_CONFIG_DAV_VENDOR = 'other'
             $env:RCLONE_CONFIG_DAV_USER   = $User
-            $env:RCLONE_CONFIG_DAV_PASS   = (($Password | & $rcloneExe obscure -) | Out-String).Trim()
+            $obscuredPassword = ($Password | & $rcloneExe obscure -) | Out-String
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($obscuredPassword)) {
+                throw 'Backup transport configuration failed; automatic backup will not run'
+            }
+            $env:RCLONE_CONFIG_DAV_PASS   = $obscuredPassword.Trim()
             $env:RESTIC_REPOSITORY        = 'rclone:dav:restic-pro'
             $env:RESTIC_CACHE_DIR         = Join-Path $env:AGENTS_BACKUP_ROOT 'restic-cache'
             $global:LASTEXITCODE = 0
@@ -438,11 +443,11 @@ jobs:
             New-Item -ItemType Directory -Path $dl -Force | Out-Null
             for ($attempt = 1; ; $attempt++) {
                 try {
-                    Invoke-WebRequest -Uri "https://downloads.rclone.org/v${env:RCLONE_VERSION}/rclone-v${env:RCLONE_VERSION}-windows-amd64.zip" -OutFile "$dl\rclone.zip" -TimeoutSec 300
+                    Invoke-WebRequest -Uri "https://downloads.rclone.org/v${env:AGENTS_RCLONE_VERSION}/rclone-v${env:AGENTS_RCLONE_VERSION}-windows-amd64.zip" -OutFile "$dl\rclone.zip" -TimeoutSec 300
                     Expand-Archive -LiteralPath "$dl\rclone.zip" -DestinationPath "$dl\rclone" -Force
                     Copy-Item (Get-ChildItem "$dl\rclone" -Recurse -Filter 'rclone.exe' | Select-Object -First 1).FullName "$tools\rclone.exe" -Force
 
-                    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/restic/restic/releases/tags/v$env:RESTIC_VERSION" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -TimeoutSec 60
+                    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/restic/restic/releases/tags/v${env:AGENTS_RESTIC_VERSION}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -TimeoutSec 60
                     $asset = $rel.assets | Where-Object { $_.name -match '_windows_amd64\.zip$' } | Select-Object -First 1
                     if (-not $asset) { throw 'restic windows_amd64 asset not found' }
                     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$dl\restic.zip" -TimeoutSec 300
@@ -455,10 +460,15 @@ jobs:
                     Start-Sleep -Seconds (5 * $attempt)
                 }
             }
+            # Check startup in every run; only verbose mode prints tool versions.
+            $rcloneVersionOutput = & "$tools\rclone.exe" version
+            if ($LASTEXITCODE -ne 0) { throw 'Backup transport startup check failed' }
+            $resticVersionOutput = & "$tools\restic.exe" version
+            if ($LASTEXITCODE -ne 0) { throw 'Backup engine startup check failed' }
             if ($debug) {
                 Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
-                Write-Host "rclone: $(& "$tools\rclone.exe" version | Select-Object -First 1)"
-                Write-Host "$(& "$tools\restic.exe" version)"
+                Write-Host "rclone: $($rcloneVersionOutput | Select-Object -First 1)"
+                Write-Host "$resticVersionOutput"
             }
         }
         if (-not $debug) {
