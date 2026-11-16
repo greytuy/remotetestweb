@@ -21,6 +21,8 @@ jobs:
       CI_DEBUG: ${{ inputs.debug }}
       AGENTS_BACKUP_ROOT: 'D:\agents-backup'
       AGENTS_PRO_DIR: 'D:\pro'
+      RESTIC_VERSION: '0.19.1'
+      RCLONE_VERSION: '1.76.0'
 
     steps:
     - name: Checkout
@@ -227,6 +229,181 @@ jobs:
             $global:LASTEXITCODE = 0
             return $code
         }
+
+        # Keep restore diagnostics outside disposable staging directories.
+        function Test-ResticTransientFailure {
+            param([string]$Text)
+            if ($Text -match '(?i)access (is )?denied|permission denied|error restoring|wrong password|incorrect password|repository does not exist|invalid data|hash mismatch|checksum|no space|disk full') {
+                return $false
+            }
+            return ($Text -match '(?i)i/o timeout|context deadline exceeded|connection (reset|refused|timed out)|TLS handshake timeout|temporary failure|unexpected EOF|HTTP[^\r\n]*\b(408|429|500|502|503|504)\b|\b(502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout)\b')
+        }
+
+        function Invoke-ResticRestoreCommand {
+            param([string[]]$Opts, [string[]]$Arguments, [string]$LogName, [switch]$ShowOutput)
+            $debug = $env:CI_DEBUG -eq 'true'
+            $logDir = Join-Path $env:AGENTS_BACKUP_ROOT 'restic-diagnostics'
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $stdoutFile = Join-Path $logDir "$LogName-$attempt.stdout.log"
+                $stderrFile = Join-Path $logDir "$LogName-$attempt.stderr.log"
+                if ($debug) { Write-Host "restic ${LogName}: attempt $attempt" }
+                if ($ShowOutput -and $debug) {
+                    & $resticExe @Opts @Arguments 2> $stderrFile | Tee-Object -FilePath $stdoutFile | ForEach-Object { Write-Host $_ }
+                } else {
+                    & $resticExe @Opts @Arguments 1> $stdoutFile 2> $stderrFile
+                }
+                $code = $LASTEXITCODE
+                $global:LASTEXITCODE = 0
+                $stderr = Get-Content -LiteralPath $stderrFile -Raw
+                if ($debug -and $stderr) { Write-Host $stderr.TrimEnd() }
+                if ($code -eq 0) { return $stdoutFile }
+                $failure = $stderr + "`n" + (Get-Content -LiteralPath $stdoutFile -Raw)
+                if ($attempt -eq 3 -or -not (Test-ResticTransientFailure $failure)) {
+                    if ($debug) { throw "restic $LogName failed (exit $code); automatic backup will not run" }
+                    throw "Build cache restore failed (exit $code); enable debug for details"
+                }
+                if ($debug) { Write-Warning "Transient transport failure during $LogName; retrying the same snapshot" }
+                Start-Sleep -Seconds (10 * $attempt)
+            }
+        }
+
+        function Get-ResticRestoreLinks {
+            param([string[]]$Opts, [string]$Snapshot)
+            $listingFile = Invoke-ResticRestoreCommand -Opts $Opts -Arguments @('ls', '--json', $Snapshot) -LogName 'list'
+            $entries = @(Get-Content -LiteralPath $listingFile | ForEach-Object {
+                $entry = $_ | ConvertFrom-Json -Depth 100
+                $path = ([string]$entry.path).Replace('\', '/')
+                # Only defer confirmed links. Real skills directories and their contents stay in restore.
+                if ($entry.type -eq 'symlink' -and $path -match '(?i)(^|/)\.claude/skills(/|$)') {
+                    [pscustomobject]@{ Path = $path; Name = $entry.name; Parent = $path.Substring(0, $path.LastIndexOf('/')) }
+                }
+            })
+            $treeNumber = 0
+            foreach ($group in ($entries | Group-Object Parent)) {
+                $treeNumber++
+                # ls --json omits link targets; cat tree exposes the original target and Windows directory bit.
+                $treeFile = Invoke-ResticRestoreCommand -Opts $Opts -Arguments @('cat', 'tree', "$Snapshot$($group.Name)") -LogName "links-$treeNumber"
+                $tree = Get-Content -LiteralPath $treeFile -Raw | ConvertFrom-Json -Depth 100
+                foreach ($entry in $group.Group) {
+                    $nodes = @($tree.nodes | Where-Object { $_.name -ceq $entry.Name })
+                    if ($nodes.Count -ne 1 -or $nodes[0].type -ne 'symlink' -or
+                        -not $nodes[0].linktarget -or $nodes[0].linktarget_raw -or $nodes[0].error) {
+                        throw "Invalid link metadata in snapshot for $($entry.Path)"
+                    }
+                    $node = $nodes[0]
+                    $attributes = $node.generic_attributes.'windows.file_attributes'
+                    $isDirectory = if ($null -ne $attributes) { ([long]$attributes -band 16) -ne 0 } else { $null }
+                    if ($env:CI_DEBUG -eq 'true') { Write-Host "Deferred skills link: $($entry.Path) -> $($node.linktarget)" }
+                    [pscustomobject]@{ Path = $entry.Path; Target = [string]$node.linktarget; IsDirectory = $isDirectory }
+                }
+            }
+        }
+
+        function Restore-ResticLinks {
+            param([object[]]$Links, [string]$Destination)
+            $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+            $pending = @($Links | ForEach-Object {
+                $link = $_
+                $path = [IO.Path]::GetFullPath((Join-Path $root $link.Path.TrimStart('/').Replace('/', '\')))
+                if (-not $path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Link path escapes the project directory: $($link.Path)"
+                }
+                $parent = [IO.Path]::GetDirectoryName($path)
+                $ancestor = $parent
+                while ($true) {
+                    $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
+                    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        throw "Link parent must be a real project directory: $ancestor"
+                    }
+                    if ($ancestor -eq $root) { break }
+                    $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+                }
+                if ($link.Target -match '^[A-Za-z]:(?![\\/])') {
+                    throw "Drive-relative link target is ambiguous: $($link.Path) -> $($link.Target)"
+                }
+                [pscustomobject]@{
+                    Path = $path; Target = $link.Target; IsDirectory = $link.IsDirectory
+                    ResolvedTarget = [IO.Path]::GetFullPath($link.Target, $parent)
+                }
+            })
+            # Target links may appear later in the manifest. Resolve dependencies without following cycles.
+            while ($pending.Count -gt 0) {
+                $remaining = @()
+                foreach ($link in $pending) {
+                    $isDirectory = [IO.Directory]::Exists($link.ResolvedTarget)
+                    if (-not $isDirectory -and -not [IO.File]::Exists($link.ResolvedTarget)) {
+                        $remaining += $link
+                        continue
+                    }
+                    if ($null -ne $link.IsDirectory -and $isDirectory -ne $link.IsDirectory) {
+                        # Older Windows restores can mislabel a relative directory link as a file link.
+                        if ($env:CI_DEBUG -eq 'true') { Write-Warning "Skills link type differs from its stored Windows attributes; using the existing target type: $($link.Path)" }
+                    }
+                    $existing = Get-Item -LiteralPath $link.Path -Force -ErrorAction SilentlyContinue
+                    if ($null -ne $existing) {
+                        if ($existing.LinkType -ne 'SymbolicLink' -or
+                            ([string]$existing.LinkTarget).Replace('/', '\') -ne $link.Target.Replace('/', '\') -or
+                            $existing.PSIsContainer -ne $isDirectory) {
+                            throw "Refusing to replace an existing item with a skills link: $($link.Path)"
+                        }
+                    } elseif ($isDirectory) {
+                        [IO.Directory]::CreateSymbolicLink($link.Path, $link.Target) | Out-Null
+                    } else {
+                        [IO.File]::CreateSymbolicLink($link.Path, $link.Target) | Out-Null
+                    }
+                    # Do not restore historical link metadata; only the target files need their original timestamps.
+                    if (-not (Test-Path -LiteralPath $link.Path)) { throw "Restored skills link is unusable: $($link.Path)" }
+                    if ($env:CI_DEBUG -eq 'true') { Write-Host "Validated skills link: $($link.Path) -> $($link.Target)" }
+                }
+                if ($remaining.Count -eq $pending.Count) {
+                    $details = ($remaining | ForEach-Object { "$($_.Path) -> $($_.Target)" }) -join '; '
+                    throw "Skills link targets are missing, inaccessible, or cyclic: $details; automatic backup will not run"
+                }
+                $pending = $remaining
+            }
+        }
+
+        function Restore-ProRestic {
+            param([string[]]$Opts, [string]$SnapshotId)
+            $debug = $env:CI_DEBUG -eq 'true'
+            if ($SnapshotId -notmatch '^[0-9a-f]{64}$') { throw 'A full, fixed snapshot ID is required for restore' }
+            $proFull = [IO.Path]::GetFullPath($env:AGENTS_PRO_DIR).TrimEnd('\')
+            $snapshotPath = '/' + $proFull.Replace(':', '').Replace('\', '/')
+            $snapshot = "${SnapshotId}:$snapshotPath"
+            if ($debug) { Write-Host "Restoring fixed snapshot $snapshot to $proFull" }
+            $resticDir = New-BackupWorkDirectory -Prefix 'restic-restore'
+            try {
+                $links = @(Get-ResticRestoreLinks -Opts $Opts -Snapshot $snapshot)
+                $logDir = Join-Path $env:AGENTS_BACKUP_ROOT 'restic-diagnostics'
+                ConvertTo-Json -InputObject $links -Depth 10 | Set-Content -LiteralPath (Join-Path $logDir 'deferred-links.json') -Encoding utf8
+                $arguments = @('restore', $snapshot, '--target', $resticDir, '--verify')
+                if ($links.Count -gt 0) {
+                    $excludeFile = Join-Path $logDir 'deferred-links.exclude'
+                    # Exclude files expand environment variables and globs; keep every path literal.
+                    $links | ForEach-Object { $_.Path.Replace('$', '$$').Replace('[', '[[]').Replace('*', '[*]').Replace('?', '[?]') } |
+                        Set-Content -LiteralPath $excludeFile -Encoding utf8
+                    $arguments += @('--exclude-file', $excludeFile)
+                }
+                # A nonzero result, including any ordinary-file metadata error, blocks the final backup marker.
+                Invoke-ResticRestoreCommand -Opts $Opts -Arguments $arguments -LogName 'restore' -ShowOutput | Out-Null
+                $copyLog = Join-Path $logDir 'copy.log'
+                robocopy $resticDir $proFull /E /SL /SJ /MT:16 /R:2 /W:1 "/LOG:$copyLog" /NFL /NDL /NJH /NJS /NS /NC /NP | Out-Null
+                $copyCode = $LASTEXITCODE
+                $global:LASTEXITCODE = 0
+                if ($copyCode -ge 8) {
+                    if ($debug) { Get-Content -LiteralPath $copyLog -Tail 100 | ForEach-Object { Write-Host $_ } }
+                    throw "desktop-pro restore copy failed: robocopy exit $copyCode"
+                }
+                Restore-ResticLinks -Links $links -Destination $proFull
+                if ($debug) { Write-Host "desktop-pro restored and verified; $($links.Count) skills link(s) validated" }
+            } catch {
+                if ($debug) { throw }
+                throw 'Build cache restore failed; enable debug for details'
+            } finally {
+                Remove-BackupWorkDirectory -Path $resticDir
+            }
+        }
         '@
         Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\backup-storage.ps1" -Value $storageHelpers -Encoding UTF8
 
@@ -261,11 +438,11 @@ jobs:
             New-Item -ItemType Directory -Path $dl -Force | Out-Null
             for ($attempt = 1; ; $attempt++) {
                 try {
-                    Invoke-WebRequest -Uri 'https://downloads.rclone.org/rclone-current-windows-amd64.zip' -OutFile "$dl\rclone.zip" -TimeoutSec 300
+                    Invoke-WebRequest -Uri "https://downloads.rclone.org/v${env:RCLONE_VERSION}/rclone-v${env:RCLONE_VERSION}-windows-amd64.zip" -OutFile "$dl\rclone.zip" -TimeoutSec 300
                     Expand-Archive -LiteralPath "$dl\rclone.zip" -DestinationPath "$dl\rclone" -Force
                     Copy-Item (Get-ChildItem "$dl\rclone" -Recurse -Filter 'rclone.exe' | Select-Object -First 1).FullName "$tools\rclone.exe" -Force
 
-                    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/restic/restic/releases/latest' -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -TimeoutSec 60
+                    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/restic/restic/releases/tags/v$env:RESTIC_VERSION" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -TimeoutSec 60
                     $asset = $rel.assets | Where-Object { $_.name -match '_windows_amd64\.zip$' } | Select-Object -First 1
                     if (-not $asset) { throw 'restic windows_amd64 asset not found' }
                     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$dl\restic.zip" -TimeoutSec 300
@@ -278,7 +455,11 @@ jobs:
                     Start-Sleep -Seconds (5 * $attempt)
                 }
             }
-            if ($debug) { Write-Host "rclone: $(& "$tools\rclone.exe" version | Select-Object -First 1)"; Write-Host "$(& "$tools\restic.exe" version)" }
+            if ($debug) {
+                Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
+                Write-Host "rclone: $(& "$tools\rclone.exe" version | Select-Object -First 1)"
+                Write-Host "$(& "$tools\restic.exe" version)"
+            }
         }
         if (-not $debug) {
             Write-Host "added 1,247 packages in 18.3s"
@@ -641,7 +822,7 @@ jobs:
                     if (Test-Path $src) {
                         $archiveFiles = @(Get-ChildItem -LiteralPath $src -File -Recurse -Force -ErrorAction SilentlyContinue)
                         if ($debug) { Write-Host "  Archive item $($t.Name): $($archiveFiles.Count) file(s)" }
-                        robocopy $src $t.Dest /E /MT:16 /R:2 /W:1 /NFL /NDL /NJH /NJS /NS /NC /NP | Out-Null
+                        robocopy $src $t.Dest /E /SL /SJ /MT:16 /R:2 /W:1 /NFL /NDL /NJH /NJS /NS /NC /NP | Out-Null
                         # robocopy: 0-7 are success; >=8 means the restore is incomplete.
                         if ($LASTEXITCODE -ge 8) { throw "Restore copy failed for $($t.Name): robocopy exit $LASTEXITCODE" }
                         $global:LASTEXITCODE = 0
@@ -667,15 +848,19 @@ jobs:
             # copy inside the 7z archive is not restored on top of it.
             $resticPro = 'none'   # none | present | error
             $resticOpts = $null
+            $resticSnapshotId = $null
             if ((Test-ResticEnabled) -and $env:WEBDAV_URL -and $env:WEBDAV_USER -and $env:WEBDAV_PASSWORD) {
                 $resticOpts = Initialize-Restic -Url $env:WEBDAV_URL -User $env:WEBDAV_USER -Password $env:WEBDAV_PASSWORD
                 $state = Get-ResticRepoState $resticOpts
                 if ($state -eq 0) {
-                    $snapJson = & $resticExe @resticOpts snapshots --host $resticHost --tag pro --latest 1 --json 2>$null
-                    if ($LASTEXITCODE -eq 0) {
-                        $resticPro = if (@($snapJson | ConvertFrom-Json).Count -gt 0) { 'present' } else { 'none' }
-                    } else { $resticPro = 'error' }
-                    $global:LASTEXITCODE = 0
+                    $snapFile = Invoke-ResticRestoreCommand -Opts $resticOpts -Arguments @('snapshots', '--host', $resticHost, '--tag', 'pro', '--latest', '1', '--json') -LogName 'snapshots'
+                    $snapshots = @(Get-Content -LiteralPath $snapFile -Raw | ConvertFrom-Json)
+                    if ($snapshots.Count -gt 0) {
+                        $selected = $snapshots | Sort-Object { [DateTimeOffset]$_.time } -Descending | Select-Object -First 1
+                        $resticSnapshotId = $selected.id
+                        $resticPro = 'present'
+                        if ($debug) { Write-Host "Selected desktop-pro snapshot: $resticSnapshotId ($($selected.time))" }
+                    }
                 } elseif ($state -ne 10) {
                     $resticPro = 'error'
                 }
@@ -751,31 +936,8 @@ jobs:
                 throw 'desktop-pro restic repository exists but is unreachable; automatic backup will not run'
             }
             if ($resticPro -eq 'present') {
-                if ($debug) { Write-Host "Restoring desktop-pro from restic..." }
-                $resticDir = New-BackupWorkDirectory -Prefix 'restic-restore'
-                try {
-                    $ok = $false
-                    for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
-                        & $resticExe @resticOpts restore latest --host $resticHost --tag pro --target $resticDir --quiet
-                        if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds (10 * $attempt) }
-                    }
-                    $global:LASTEXITCODE = 0
-                    if (-not $ok) { throw 'desktop-pro restic restore failed; automatic backup will not run' }
-
-                    $proFull = [IO.Path]::GetFullPath($env:AGENTS_PRO_DIR).TrimEnd('\')
-                    $proSrc = Join-Path $resticDir ($proFull.Substring(0, 1) + $proFull.Substring(2))
-                    if (-not (Test-Path -LiteralPath $proSrc)) {
-                        $proSrc = (Get-ChildItem -LiteralPath $resticDir -Directory -Recurse -Depth 3 -Filter (Split-Path $proFull -Leaf) | Select-Object -First 1).FullName
-                    }
-                    if (-not $proSrc) { throw 'desktop-pro not found inside the restic snapshot' }
-                    robocopy $proSrc $env:AGENTS_PRO_DIR /E /MT:16 /R:2 /W:1 /NFL /NDL /NJH /NJS /NS /NC /NP | Out-Null
-                    if ($LASTEXITCODE -ge 8) { throw "desktop-pro restore copy failed: robocopy exit $LASTEXITCODE" }
-                    $global:LASTEXITCODE = 0
-                    $restored = $true
-                    if ($debug) { Write-Host "desktop-pro restored from restic" }
-                } finally {
-                    Remove-BackupWorkDirectory -Path $resticDir
-                }
+                Restore-ProRestic -Opts $resticOpts -SnapshotId $resticSnapshotId
+                $restored = $true
             }
 
             if ($restored) {
