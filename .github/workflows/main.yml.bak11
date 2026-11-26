@@ -1,0 +1,77 @@
+name: Remote workspace
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable private local diagnostics (never upload them publicly)'
+        required: false
+        default: false
+        type: boolean
+
+# Each backup destination has one writer. Never cancel a running backup to start another.
+concurrency:
+  group: remote-workspace-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Remote workspace
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      CI_DEBUG: ${{ inputs.debug }}
+      AGENTS_PRO_DIR: 'D:\pro'
+      AGENTS_RESTIC_VERSION: '0.19.1'
+      AGENTS_RCLONE_VERSION: '1.76.0'
+    steps:
+      - name: Check active runs, validate runtime revision and capture job start
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_REF: ${{ vars.RUNNER_CONTROL_REF }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNTIME_REF -notmatch '^[0-9a-f]{40}$') {
+            throw 'Set RUNNER_CONTROL_REF to the reviewed 40-character commit of greytuy/runner-control.'
+          }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $runsUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/workflows/main.yml/runs?status=in_progress&per_page=100"
+          $activeRuns = Invoke-RestMethod -Uri $runsUri -Headers $headers
+          if ($activeRuns.total_count -gt 100 -or $null -eq $activeRuns.workflow_runs) {
+            throw 'Cannot safely determine whether another workspace is active.'
+          }
+          $otherRuns = @($activeRuns.workflow_runs | Where-Object { [string]$_.id -ne $env:GITHUB_RUN_ID })
+          if ($otherRuns.Count -gt 0) {
+            throw 'Another remote workspace is still running. Wait for it to finish before starting this run.'
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/attempts/$env:GITHUB_RUN_ATTEMPT/jobs"
+          $response = Invoke-RestMethod -Uri $uri -Headers $headers
+          $job = @($response.jobs | Where-Object { $_.name -eq 'Remote workspace' -and $_.status -eq 'in_progress' })
+          if ($job.Count -ne 1 -or -not $job[0].started_at) { throw 'Cannot determine the current job start time safely.' }
+          "RC_JOB_STARTED_AT=$($job[0].started_at)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Checkout reviewed private runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned 2026-11-25
+        with:
+          repository: greytuy/runner-control
+          ref: ${{ vars.RUNNER_CONTROL_REF }}
+          ssh-key: ${{ secrets.RUNNER_CONTROL_SSH_KEY }}
+          path: runner-control
+          persist-credentials: false
+
+      - name: Restore, open remote desktop and supervise backups
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+        run: ./runner-control/src/Start-Runner.ps1
