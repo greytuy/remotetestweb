@@ -28,6 +28,8 @@ jobs:
       AGENTS_PRO_DIR: 'D:\pro'
       AGENTS_RESTIC_VERSION: '0.19.1'
       AGENTS_RCLONE_VERSION: '1.76.0'
+      RC_ARCHIVE_TRANSFERS: ${{ vars.ARCHIVE_TRANSFERS || '4' }}
+      RC_RESTIC_CONNECTIONS: ${{ vars.STORAGE_CONNECTIONS || '8' }}
     steps:
       - name: Validate configuration
         shell: pwsh
@@ -64,7 +66,7 @@ jobs:
           path: runner-control
           persist-credentials: false
 
-      - name: Build and deploy
+      - name: Prepare environment
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,4 +76,44 @@ jobs:
           RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
-        run: ./runner-control/src/Start-Runner.ps1
+        run: ./runner-control/src/Start-Runner.ps1 -Stage Prepare
+
+      - name: Restore workspace
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+        run: ./runner-control/src/Start-Runner.ps1 -Stage Restore
+
+      - name: Install tools
+        shell: pwsh
+        run: ./runner-control/src/Start-Runner.ps1 -Stage Tools
+
+      - name: Start services (ready for connection)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+        run: ./runner-control/src/Start-Runner.ps1 -Stage Connect
+
+      - name: Run scheduled tasks
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+        run: ./runner-control/src/Start-Runner.ps1 -Stage Run
